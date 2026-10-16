@@ -13,6 +13,9 @@ local container = Instance.new("Folder",
 -- locals
 local floor = math.floor;
 local round = math.round;
+local clamp = math.clamp;
+local mathMin = math.min;
+local mathMax = math.max;
 local sin = math.sin;
 local cos = math.cos;
 local clear = table.clear;
@@ -42,8 +45,9 @@ local HEALTH_BAR_OFFSET = Vector2.new(5, 0);
 local HEALTH_TEXT_OFFSET = Vector2.new(3, 0);
 local HEALTH_BAR_OUTLINE_OFFSET = Vector2.new(0, 1);
 local NAME_OFFSET = Vector2.new(0, 2);
+local GRADIENT_DEFAULT_SEGMENTS = 16;
+local GRADIENT_MAX_SEGMENTS = 64;
 local DISTANCE_OFFSET = Vector2.new(0, 2);
-local GRADIENT_SEGMENTS = 16; -- кол-во сегментов градиента health bar
 local VERTICES = {
 	Vector3.new(-1, -1, -1),
 	Vector3.new(-1, 1, -1),
@@ -135,6 +139,7 @@ function EspObject:Construct()
 	self.charCache = {};
 	self.childCount = 0;
 	self.bin = {};
+	self.healthBarSegments = {};
 	self.drawings = {
 		box3d = {
 			{
@@ -166,14 +171,6 @@ function EspObject:Construct()
 			box = self:_create("Square", { Thickness = 1, Visible = false }),
 			healthBarOutline = self:_create("Line", { Thickness = 3, Visible = false }),
 			healthBar = self:_create("Line", { Thickness = 1, Visible = false }),
-			-- сегменты градиента health bar
-			healthBarSegments = (function()
-				local segs = {};
-				for i = 1, GRADIENT_SEGMENTS do
-					segs[i] = self:_create("Line", { Thickness = 1, Visible = false });
-				end
-				return segs;
-			end)(),
 			healthText = self:_create("Text", { Center = true, Visible = false }),
 			name = self:_create("Text", { Text = self.player.DisplayName, Center = true, Visible = false }),
 			distance = self:_create("Text", { Center = true, Visible = false }),
@@ -189,6 +186,42 @@ function EspObject:Construct()
 		self:Update(deltaTime);
 		self:Render(deltaTime);
 	end);
+end
+
+function EspObject:HideGradient(from)
+	local segments = self.healthBarSegments;
+	for i = from or 1, #segments do
+		segments[i].Visible = false;
+	end
+end
+
+-- gradient: цвет зависит от позиции на полосе (снизу dyingColor -> сверху healthyColor)
+function EspObject:RenderGradient(barFrom, barTo, ratio, options)
+	local segments = self.healthBarSegments;
+	local count = clamp(floor(options.healthBarGradientSegments or GRADIENT_DEFAULT_SEGMENTS), 1, GRADIENT_MAX_SEGMENTS);
+	local used = 0;
+
+	for i = 1, count do
+		local t0 = (i - 1)/count;
+		local t1 = mathMin(i/count, ratio);
+		if t1 <= t0 then
+			break;
+		end
+
+		used = i;
+		local segment = segments[i];
+		if not segment then
+			segment = self:_create("Line", { Thickness = 1, Visible = false });
+			segments[i] = segment;
+		end
+
+		segment.From = lerp2(barTo, barFrom, t0);
+		segment.To = lerp2(barTo, barFrom, t1);
+		segment.Color = lerpColor(options.dyingColor, options.healthyColor, (t0 + t1)*0.5);
+		segment.Visible = true;
+	end
+
+	self:HideGradient(used + 1);
 end
 
 function EspObject:Destruct()
@@ -286,79 +319,34 @@ function EspObject:Render()
 		boxFill.Transparency = options.boxFillColor[2];
 	end
 
-	-- ===== HEALTH BAR (с поддержкой градиента) =====
-	local useGradient = options.healthBarGradient and options.healthBarGradient.Enabled;
-	local ratio = (self.maxHealth and self.maxHealth > 0) and (self.health / self.maxHealth) or 0;
-	ratio = math.clamp(ratio, 0, 1);
-
-	-- базовая линия показывается только если градиент выключен
-	visible.healthBar.Visible = enabled and onScreen and options.healthBar and not useGradient;
-	visible.healthBarOutline.Visible = enabled and onScreen and options.healthBar and options.healthBarOutline;
-
-	if enabled and onScreen and options.healthBar then
+	local healthBarVisible = enabled and onScreen and options.healthBar;
+	local useGradient = healthBarVisible and options.healthBarGradient;
+	visible.healthBar.Visible = healthBarVisible and not useGradient;
+	visible.healthBarOutline.Visible = healthBarVisible and options.healthBarOutline;
+	if healthBarVisible then
 		local barFrom = corners.topLeft - HEALTH_BAR_OFFSET;
 		local barTo = corners.bottomLeft - HEALTH_BAR_OFFSET;
+		local ratio = clamp(self.health/self.maxHealth, 0, 1);
 
-		-- outline
-		if visible.healthBarOutline.Visible then
-			local healthBarOutline = visible.healthBarOutline;
-			healthBarOutline.To = barTo + HEALTH_BAR_OUTLINE_OFFSET;
-			healthBarOutline.From = barFrom - HEALTH_BAR_OUTLINE_OFFSET;
-			healthBarOutline.Color = parseColor(self, options.healthBarOutlineColor[1], true);
-			healthBarOutline.Transparency = options.healthBarOutlineColor[2];
-		end
-
-		-- обычный режим
-		if visible.healthBar.Visible then
+		if useGradient then
+			self:RenderGradient(barFrom, barTo, ratio, options);
+		else
 			local healthBar = visible.healthBar;
 			healthBar.To = barTo;
 			healthBar.From = lerp2(barTo, barFrom, ratio);
 			healthBar.Color = lerpColor(options.dyingColor, options.healthyColor, ratio);
 		end
 
-		-- градиентный режим
-		local segs = visible.healthBarSegments;
-		if useGradient then
-			local dir = barTo - barFrom;            -- направление сверху вниз
-			local fullHeight = dir.Magnitude;
-			local filledHeight = fullHeight * ratio;
-			local unit = fullHeight > 0 and dir.Unit or Vector2.zero;
-
-			local cs = options.healthBarGradient.ColorSequence;
-			local n = #segs;
-			local segH = fullHeight / n;
-
-			for i = 1, n do
-				local seg = segs[i];
-				local segTop    = (i - 1) * segH;
-				local segBottom = i * segH;
-
-				if segTop >= filledHeight then
-					seg.Visible = false;
-				else
-					seg.Visible = true;
-
-					local clampedBottom = math.min(segBottom, filledHeight);
-
-					seg.From = barFrom + unit * segTop;
-					seg.To   = barFrom + unit * clampedBottom;
-
-					local midT = (segTop + clampedBottom) * 0.5 / fullHeight;
-					if cs then
-						seg.Color = cs:Evaluate(midT);
-					else
-						seg.Color = lerpColor(options.dyingColor, options.healthyColor, midT);
-					end
-					seg.Transparency = 1;
-				end
-			end
-		else
-			for i = 1, #segs do
-				segs[i].Visible = false;
-			end
-		end
+		local healthBarOutline = visible.healthBarOutline;
+		healthBarOutline.To = barTo + HEALTH_BAR_OUTLINE_OFFSET;
+		healthBarOutline.From = barFrom - HEALTH_BAR_OUTLINE_OFFSET;
+		healthBarOutline.Color = parseColor(self, options.healthBarOutlineColor[1], true);
+		healthBarOutline.Transparency = options.healthBarOutlineColor[2];
 	end
-	-- ===== /HEALTH BAR =====
+
+	if not useGradient and #self.healthBarSegments > 0 then
+		self:HideGradient();
+	end
 
 	visible.healthText.Visible = enabled and onScreen and options.healthText;
 	if visible.healthText.Visible then
@@ -373,7 +361,7 @@ function EspObject:Render()
 		healthText.Transparency = options.healthTextColor[2];
 		healthText.Outline = options.healthTextOutline;
 		healthText.OutlineColor = parseColor(self, options.healthTextOutlineColor, true);
-		healthText.Position = lerp2(barTo, barFrom, ratio) - healthText.TextBounds*0.5 - HEALTH_TEXT_OFFSET;
+		healthText.Position = lerp2(barTo, barFrom, self.health/self.maxHealth) - healthText.TextBounds*0.5 - HEALTH_TEXT_OFFSET;
 	end
 
 	visible.name.Visible = enabled and onScreen and options.name;
@@ -879,17 +867,10 @@ local EspInterface = {
 			healthBar = false,
 			healthyColor = Color3.new(0,1,0),
 			dyingColor = Color3.new(1,0,0),
+			healthBarGradient = false,
+			healthBarGradientSegments = 16,
 			healthBarOutline = true,
 			healthBarOutlineColor = { Color3.new(), 0.5 },
-			-- ГРАДИЕНТ HEALTH BAR (новое)
-			healthBarGradient = {
-				Enabled = false,
-				ColorSequence = ColorSequence.new({
-					ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),    -- сверху красный
-					ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 255, 0)), -- середина жёлтый
-					ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 255, 0)),    -- снизу зелёный
-				}),
-			},
 			healthText = false,
 			healthTextColor = { Color3.new(1,1,1), 1 },
 			healthTextOutline = true,
@@ -935,17 +916,10 @@ local EspInterface = {
 			healthBar = false,
 			healthyColor = Color3.new(0,1,0),
 			dyingColor = Color3.new(1,0,0),
+			healthBarGradient = false,
+			healthBarGradientSegments = 16,
 			healthBarOutline = true,
 			healthBarOutlineColor = { Color3.new(), 0.5 },
-			-- ГРАДИЕНТ HEALTH BAR (новое)
-			healthBarGradient = {
-				Enabled = false,
-				ColorSequence = ColorSequence.new({
-					ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
-					ColorSequenceKeypoint.new(0.5, Color3.fromRGB(255, 255, 0)),
-					ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 255, 0)),
-				}),
-			},
 			healthText = false,
 			healthTextColor = { Color3.new(1,1,1), 1 },
 			healthTextOutline = true,
