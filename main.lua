@@ -49,6 +49,8 @@ local BAR_BASE_OFFSET = 5;      -- отступ первого бара от б�
 local BAR_STACK_STEP = 6;       -- шаг между барами на одной стороне
 local BAR_OUTLINE_OFFSET_H = Vector2.new(1, 0);
 local BAR_SIDES = { "Left", "Right", "Top", "Bottom" };
+local TEXT_RIGHT_GAP = 4;      -- отступ кастомного текста от бокса / баров справа
+local TEXT_LINE_GAP = 1;       -- расстояние между строками кастомного текста
 local GRADIENT_DEFAULT_SEGMENTS = 16;
 local GRADIENT_MAX_SEGMENTS = 64;
 local DISTANCE_OFFSET = Vector2.new(0, 2);
@@ -341,6 +343,14 @@ local function normalizeBar(spec)
 	spec._normalized = true;
 end
 
+local function normalizeText(spec)
+	spec.enabled = spec.enabled == nil and true or spec.enabled;
+	spec.color = spec.color or { Color3.new(1, 1, 1), 1 };
+	spec.outline = spec.outline == nil and true or spec.outline;
+	spec.outlineColor = spec.outlineColor or Color3.new();
+	spec._normalized = true;
+end
+
 local function barExtent(count, hasText, distance, textSize)
 	if hasText then
 		return distance + 3 + textSize + 2;
@@ -441,6 +451,11 @@ function EspObject:Construct()
 	self.renderId = 0;
 	self.topExtent = 0;
 	self.bottomExtent = 0;
+	self.textData = {};
+	self.textCount = 0;
+	self.textSlots = {};
+	self.textList = {};
+	self.rightTextWidth = 0;
 	self.sideCount = { Left = 0, Right = 0, Top = 0, Bottom = 0 };
 	self.sideText = { Left = false, Right = false, Top = false, Bottom = false };
 	self.sideDistance = { Left = BAR_BASE_OFFSET, Right = BAR_BASE_OFFSET, Top = BAR_BASE_OFFSET, Bottom = BAR_BASE_OFFSET };
@@ -540,6 +555,107 @@ function EspObject:UpdateBars()
 	self.barCount = count;
 end
 
+-- кастомные тексты справа от бокса: значения из getText, вызывается из Update
+function EspObject:UpdateTexts()
+	local interface = self.interface;
+	local specs = self.options.texts;
+	local data = self.textData;
+	local count = 0;
+
+	if specs then
+		for i = 1, #specs do
+			local spec = specs[i];
+			if not spec._normalized then
+				normalizeText(spec);
+			end
+
+			if spec.enabled and spec.name then
+				local text;
+				if type(spec.text) == "string" then
+					text = spec.text;
+				else
+					local ok, result = pcall(spec.getText or interface.getText, self.player, spec.name);
+					text = ok and result or nil;
+				end
+
+				if text ~= nil and text ~= "" then
+					count = count + 1;
+					local item = data[count];
+					if not item then
+						item = {};
+						data[count] = item;
+					end
+					item.spec = spec;
+					item.text = tostring(text);
+				end
+			end
+		end
+	end
+
+	self.textCount = count;
+end
+
+function EspObject:_getTextSlot(name)
+	local slot = self.textSlots[name];
+	if not slot then
+		slot = {
+			drawing = self:_create("Text", { Center = true, Visible = false }),
+			glowKey = "customText:" .. name
+		};
+		self.textSlots[name] = slot;
+		self.textList[#self.textList + 1] = slot;
+	end
+	return slot;
+end
+
+-- стек кастомных текстов: каждый следующий видимый текст ниже предыдущего,
+-- всё сдвигается правее, если справа есть бары (и их текст)
+function EspObject:RenderTexts(active, corners)
+	local renderId = self.renderId;
+
+	if active and self.textCount > 0 then
+		local interface = self.interface;
+		local extent = 0;
+		if self.sideText.Right then
+			extent = self.sideDistance.Right + HEALTH_TEXT_OFFSET.X + self.rightTextWidth + 2;
+		elseif self.sideCount.Right > 0 then
+			extent = self.sideDistance.Right + 2;
+		end
+
+		local x = corners.topRight.X + extent + TEXT_RIGHT_GAP;
+		local y = corners.topRight.Y;
+		local data = self.textData;
+
+		for i = 1, self.textCount do
+			local item = data[i];
+			local spec = item.spec;
+			local slot = self:_getTextSlot(spec.name);
+			slot.usedId = renderId;
+
+			local drawing = slot.drawing;
+			drawing.Visible = true;
+			drawing.Text = item.text;
+			drawing.Size = spec.size or interface.sharedSettings.textSize;
+			drawing.Font = spec.font or interface.sharedSettings.textFont;
+			drawing.Color = parseColor(self, spec.color[1]);
+			drawing.Transparency = spec.color[2];
+			drawing.Outline = spec.outline;
+			drawing.OutlineColor = parseColor(self, spec.outlineColor, true);
+
+			local bounds = drawing.TextBounds;
+			drawing.Position = Vector2.new(x + bounds.X*0.5, y);
+			y = y + bounds.Y + (spec.spacing or TEXT_LINE_GAP);
+		end
+	end
+
+	local list = self.textList;
+	for i = 1, #list do
+		if list[i].usedId ~= renderId then
+			list[i].drawing.Visible = false;
+		end
+	end
+end
+
 function EspObject:_pushEntry(n, slot, spec, value, max, defaultSide, drawBar, drawText)
 	n = n + 1;
 	local entry = self.barEntries[n];
@@ -579,6 +695,8 @@ function EspObject:LayoutBars(active, options)
 		counts[side] = 0;
 		texts[side] = false;
 	end
+
+	self.rightTextWidth = 0;
 
 	local n = 0;
 	if active then
@@ -716,14 +834,17 @@ function EspObject:RenderBar(entry, corners)
 
 		local half = text.TextBounds*0.5;
 		local gap = HEALTH_TEXT_OFFSET.X;
+		if side == "Right" then
+			self.rightTextWidth = mathMax(self.rightTextWidth, half.X*2);
+		end
 		if side == "Left" then
 			text.Position = Vector2.new(topLeft.X - textDistance - gap - half.X, fillEnd.Y - half.Y);
 		elseif side == "Right" then
 			text.Position = Vector2.new(topRight.X + textDistance + gap + half.X, fillEnd.Y - half.Y);
 		elseif side == "Top" then
-			text.Position = Vector2.new(fillEnd.X - half.X, topLeft.Y - textDistance - gap - half.Y);
+			text.Position = Vector2.new(fillEnd.X - half.X, topLeft.Y - textDistance - gap - half.Y*2);
 		else
-			text.Position = Vector2.new(fillEnd.X - half.X, bottomLeft.Y + textDistance + gap + half.Y);
+			text.Position = Vector2.new(fillEnd.X - half.X, bottomLeft.Y + textDistance + gap);
 		end
 	else
 		text.Visible = false;
@@ -752,8 +873,10 @@ function EspObject:Update()
 		(#interface.whitelist > 0 and not find(interface.whitelist, self.player.UserId));
 
 	self.barCount = 0;
+	self.textCount = 0;
 	if self.enabled then
 		self:UpdateBars();
+		self:UpdateTexts();
 	end
 
 	local head = self.enabled and findFirstChild(self.character, "Head");
@@ -843,6 +966,7 @@ function EspObject:Render()
 			self:HideBar(slot);
 		end
 	end
+	self:RenderTexts(enabled and onScreen, corners);
 
 	visible.name.Visible = enabled and onScreen and options.name;
 	if visible.name.Visible then
@@ -960,6 +1084,11 @@ function EspObject:Render()
 			local slot = self.barSlots[i];
 			glowLine(self, slot.glowBar, slot.glowShow, slot.gFrom, slot.gTo, slot.gTint, 1, options, slot.glowBarElement, slot.gBase);
 			glowText(self, slot.glowText, slot.text, options, slot.glowTextElement);
+		end
+
+		for i = 1, #self.textList do
+			local slot = self.textList[i];
+			glowText(self, slot.glowKey, slot.drawing, options, "customText");
 		end
 
 		glowText(self, "name", visible.name, options, "name");
@@ -1444,6 +1573,10 @@ local EspInterface = {
 			-- bars = { { name = "armor", position = "Right", healthyColor = Color3.new(0, 0.6, 1), text = true } },
 			-- либо EspInterface.AddBar("armor", { position = "Right", text = true })
 			bars = {},
+			-- кастомные тексты справа от бокса, значения из EspInterface.getText(player, name):
+			-- texts = { { name = "ammo", color = { Color3.new(1, 1, 0), 1 } } },
+			-- либо EspInterface.AddText("ammo", { color = { Color3.new(1, 1, 0), 1 } })
+			texts = {},
 			healthBarGradient = false,
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
@@ -1506,6 +1639,10 @@ local EspInterface = {
 			-- bars = { { name = "armor", position = "Right", healthyColor = Color3.new(0, 0.6, 1), text = true } },
 			-- либо EspInterface.AddBar("armor", { position = "Right", text = true })
 			bars = {},
+			-- кастомные тексты справа от бокса, значения из EspInterface.getText(player, name):
+			-- texts = { { name = "ammo", color = { Color3.new(1, 1, 0), 1 } } },
+			-- либо EspInterface.AddText("ammo", { color = { Color3.new(1, 1, 0), 1 } })
+			texts = {},
 			healthBarGradient = false,
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
@@ -1563,13 +1700,13 @@ end
 --   healthyColor, dyingColor, gradient, gradientSegments, outline, outlineColor = { Color3, transparency }
 --   text, textColor = { Color3, transparency }, textOutline, textOutlineColor, textSuffix, textFormat = function(value, max)
 --   getValue = function(player, name) return value, max end -- переопределяет EspInterface.getValue
-function EspInterface.AddBar(name, config, team)
+local function addSpec(listName, normalize, name, config, team)
 	assert(type(name) == "string", "Missing argument #1 (string expected)");
 
 	local spec = config or {};
 	spec.name = name;
 	spec._normalized = nil;
-	normalizeBar(spec);
+	normalize(spec);
 
 	local targets = {};
 	if team then
@@ -1580,36 +1717,58 @@ function EspInterface.AddBar(name, config, team)
 
 	for i = 1, #targets do
 		local settings = targets[i];
-		settings.bars = settings.bars or {};
+		settings[listName] = settings[listName] or {};
 
-		local bars, replaced = settings.bars, false;
-		for j = 1, #bars do
-			if bars[j].name == name then
-				bars[j] = spec;
+		local list, replaced = settings[listName], false;
+		for j = 1, #list do
+			if list[j].name == name then
+				list[j] = spec;
 				replaced = true;
 				break;
 			end
 		end
 		if not replaced then
-			bars[#bars + 1] = spec;
+			list[#list + 1] = spec;
 		end
 	end
 	return spec;
 end
 
-function EspInterface.RemoveBar(name, team)
-	for _, settings in next, EspInterface.teamSettings do
-		if not team or EspInterface.teamSettings[team] == settings then
-			local bars = settings.bars;
-			if bars then
-				for i = #bars, 1, -1 do
-					if bars[i].name == name then
-						table.remove(bars, i);
+local function removeSpec(listName, name, team)
+	for teamName, settings in next, EspInterface.teamSettings do
+		if not team or team == teamName then
+			local list = settings[listName];
+			if list then
+				for i = #list, 1, -1 do
+					if list[i].name == name then
+						table.remove(list, i);
 					end
 				end
 			end
 		end
 	end
+end
+
+function EspInterface.AddBar(name, config, team)
+	return addSpec("bars", normalizeBar, name, config, team);
+end
+
+function EspInterface.RemoveBar(name, team)
+	removeSpec("bars", name, team);
+end
+
+-- кастомные тексты справа от бокса: EspInterface.AddText(name, config, team)
+-- Конфиг (все поля необязательны):
+--   color = { Color3, transparency }, outline, outlineColor, size, font, spacing
+--   text = "строка" -- статичный текст (вместо getText)
+--   getText = function(player, name) return "30/90" end -- переопределяет EspInterface.getText
+-- Текст nil или "" = строка скрыта, следующие поднимаются вверх
+function EspInterface.AddText(name, config, team)
+	return addSpec("texts", normalizeText, name, config, team);
+end
+
+function EspInterface.RemoveText(name, team)
+	removeSpec("texts", name, team);
 end
 
 function EspInterface.Load()
@@ -1665,6 +1824,12 @@ end
 -- значение для кастомных баров: return value, maxValue (nil = бар скрыт)
 -- пример: if name == "armor" then return player.Character.Armor.Value, 100 end
 function EspInterface.getValue(player, name)
+	return nil;
+end
+
+-- текст для кастомных строк справа от бокса: return "строка" (nil / "" = скрыто)
+-- пример: if name == "ammo" then return player.Character.Gun.Ammo.Value .. "/" .. player.Character.Gun.Reserve.Value end
+function EspInterface.getText(player, name)
 	return nil;
 end
 
