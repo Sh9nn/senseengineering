@@ -45,6 +45,10 @@ local HEALTH_BAR_OFFSET = Vector2.new(5, 0);
 local HEALTH_TEXT_OFFSET = Vector2.new(3, 0);
 local HEALTH_BAR_OUTLINE_OFFSET = Vector2.new(0, 1);
 local NAME_OFFSET = Vector2.new(0, 2);
+local BAR_BASE_OFFSET = 5;      -- отступ первого бара от бокса
+local BAR_STACK_STEP = 6;       -- шаг между барами на одной стороне
+local BAR_OUTLINE_OFFSET_H = Vector2.new(1, 0);
+local BAR_SIDES = { "Left", "Right", "Top", "Bottom" };
 local GRADIENT_DEFAULT_SEGMENTS = 16;
 local GRADIENT_MAX_SEGMENTS = 64;
 local DISTANCE_OFFSET = Vector2.new(0, 2);
@@ -308,6 +312,44 @@ local function glowText(self, key, main, options, element)
 	end
 end
 
+-- bars
+local function normalizeSide(position, default)
+	if position == "Left" or position == "Right" or position == "Top" or position == "Bottom" then
+		return position;
+	elseif position == "Below" then
+		return "Bottom";
+	elseif position == "Above" then
+		return "Top";
+	end
+	return default;
+end
+
+local function normalizeBar(spec)
+	spec.enabled = spec.enabled == nil and true or spec.enabled;
+	spec.position = spec.position or "Right";
+	spec.outline = spec.outline == nil and true or spec.outline;
+	spec.outlineColor = spec.outlineColor or { Color3.new(), 0.5 };
+	spec.healthyColor = spec.healthyColor or Color3.new(0, 1, 0);
+	spec.dyingColor = spec.dyingColor or Color3.new(1, 0, 0);
+	spec.gradient = spec.gradient or false;
+	spec.gradientSegments = spec.gradientSegments or GRADIENT_DEFAULT_SEGMENTS;
+	spec.text = spec.text or false;
+	spec.textColor = spec.textColor or { Color3.new(1, 1, 1), 1 };
+	spec.textOutline = spec.textOutline == nil and true or spec.textOutline;
+	spec.textOutlineColor = spec.textOutlineColor or Color3.new();
+	spec.textSuffix = spec.textSuffix or "";
+	spec._normalized = true;
+end
+
+local function barExtent(count, hasText, distance, textSize)
+	if hasText then
+		return distance + 3 + textSize + 2;
+	elseif count > 0 then
+		return distance + 2;
+	end
+	return 0;
+end
+
 -- esp object
 local EspObject = {};
 EspObject.__index = EspObject;
@@ -378,23 +420,47 @@ function EspObject:Construct()
 		}
 	};
 
+	-- bars state
+	self.healthSpec = {};
+	self.mainSlot = {
+		outline = self.drawings.visible.healthBarOutline,
+		line = self.drawings.visible.healthBar,
+		text = self.drawings.visible.healthText,
+		segments = self.healthBarSegments,
+		glowBar = "healthBar",
+		glowText = "healthText",
+		glowBarElement = "healthBar",
+		glowTextElement = "healthText"
+	};
+	self.barSlots = { self.mainSlot };
+	self.barByName = {};
+	self.barEntries = {};
+	self.barData = {};
+	self.barCount = 0;
+	self.entryCount = 0;
+	self.renderId = 0;
+	self.topExtent = 0;
+	self.bottomExtent = 0;
+	self.sideCount = { Left = 0, Right = 0, Top = 0, Bottom = 0 };
+	self.sideText = { Left = false, Right = false, Top = false, Bottom = false };
+	self.sideDistance = { Left = BAR_BASE_OFFSET, Right = BAR_BASE_OFFSET, Top = BAR_BASE_OFFSET, Bottom = BAR_BASE_OFFSET };
+
 	self.renderConnection = runService.Heartbeat:Connect(function(deltaTime)
 		self:Update(deltaTime);
 		self:Render(deltaTime);
 	end);
 end
 
-function EspObject:HideGradient(from)
-	local segments = self.healthBarSegments;
+function EspObject:HideGradient(segments, from)
 	for i = from or 1, #segments do
 		segments[i].Visible = false;
 	end
 end
 
--- gradient: цвет зависит от позиции на полосе (снизу dyingColor -> сверху healthyColor)
-function EspObject:RenderGradient(barFrom, barTo, ratio, options)
-	local segments = self.healthBarSegments;
-	local count = clamp(floor(options.healthBarGradientSegments or GRADIENT_DEFAULT_SEGMENTS), 1, GRADIENT_MAX_SEGMENTS);
+-- gradient: цвет зависит от позиции на полосе (начало dyingColor -> конец healthyColor)
+function EspObject:RenderGradient(slot, barFrom, barTo, ratio, spec)
+	local segments = slot.segments;
+	local count = clamp(floor(spec.gradientSegments or GRADIENT_DEFAULT_SEGMENTS), 1, GRADIENT_MAX_SEGMENTS);
 	local used = 0;
 
 	for i = 1, count do
@@ -413,11 +479,255 @@ function EspObject:RenderGradient(barFrom, barTo, ratio, options)
 
 		segment.From = lerp2(barTo, barFrom, t0);
 		segment.To = lerp2(barTo, barFrom, t1);
-		segment.Color = lerpColor(options.dyingColor, options.healthyColor, (t0 + t1)*0.5);
+		segment.Color = lerpColor(spec.dyingColor, spec.healthyColor, (t0 + t1)*0.5);
 		segment.Visible = true;
 	end
 
-	self:HideGradient(used + 1);
+	self:HideGradient(segments, used + 1);
+end
+
+function EspObject:_getBarSlot(name)
+	local slot = self.barByName[name];
+	if not slot then
+		slot = {
+			outline = self:_create("Line", { Thickness = 3, Visible = false }),
+			line = self:_create("Line", { Thickness = 1, Visible = false }),
+			text = self:_create("Text", { Center = true, Visible = false }),
+			segments = {},
+			glowBar = "bar:" .. name,
+			glowText = "barText:" .. name,
+			glowBarElement = "bar",
+			glowTextElement = "barText"
+		};
+		self.barByName[name] = slot;
+		self.barSlots[#self.barSlots + 1] = slot;
+	end
+	return slot;
+end
+
+-- значения кастомных баров (getValue), вызывается из Update
+function EspObject:UpdateBars()
+	local interface = self.interface;
+	local specs = self.options.bars;
+	local data = self.barData;
+	local count = 0;
+
+	if specs then
+		for i = 1, #specs do
+			local spec = specs[i];
+			if not spec._normalized then
+				normalizeBar(spec);
+			end
+
+			if spec.enabled and spec.name then
+				local getter = spec.getValue or interface.getValue;
+				local ok, value, max = pcall(getter, self.player, spec.name);
+				if ok and type(value) == "number" then
+					count = count + 1;
+					local item = data[count];
+					if not item then
+						item = {};
+						data[count] = item;
+					end
+					item.spec = spec;
+					item.value = value;
+					item.max = type(max) == "number" and max or 100;
+				end
+			end
+		end
+	end
+
+	self.barCount = count;
+end
+
+function EspObject:_pushEntry(n, slot, spec, value, max, defaultSide, drawBar, drawText)
+	n = n + 1;
+	local entry = self.barEntries[n];
+	if not entry then
+		entry = {};
+		self.barEntries[n] = entry;
+	end
+
+	local side = normalizeSide(spec.position, defaultSide);
+	entry.slot = slot;
+	entry.spec = spec;
+	entry.value = value;
+	entry.max = max;
+	entry.side = side;
+	entry.drawBar = drawBar;
+	entry.drawText = drawText;
+
+	if drawBar then
+		local index = self.sideCount[side] + 1;
+		self.sideCount[side] = index;
+		entry.index = index;
+	else
+		entry.index = 0;
+	end
+
+	if drawText then
+		self.sideText[side] = true;
+	end
+	return n;
+end
+
+-- раскладка баров по сторонам (стек наружу от бокса), считает сдвиги для name/distance/weapon
+function EspObject:LayoutBars(active, options)
+	local counts, texts, distances = self.sideCount, self.sideText, self.sideDistance;
+	for i = 1, #BAR_SIDES do
+		local side = BAR_SIDES[i];
+		counts[side] = 0;
+		texts[side] = false;
+	end
+
+	local n = 0;
+	if active then
+		-- основной healthBar
+		local spec = self.healthSpec;
+		spec.enabled = options.healthBar;
+		spec.position = options.healthBarPosition;
+		spec.outline = options.healthBarOutline;
+		spec.outlineColor = options.healthBarOutlineColor;
+		spec.healthyColor = options.healthyColor;
+		spec.dyingColor = options.dyingColor;
+		spec.gradient = options.healthBarGradient;
+		spec.gradientSegments = options.healthBarGradientSegments;
+		spec.text = options.healthText;
+		spec.textColor = options.healthTextColor;
+		spec.textOutline = options.healthTextOutline;
+		spec.textOutlineColor = options.healthTextOutlineColor;
+		spec.textSuffix = "hp";
+
+		local drawBar = spec.enabled and true or false;
+		local drawText = spec.text and true or false;
+		if drawBar or drawText then
+			n = self:_pushEntry(n, self.mainSlot, spec, self.health, self.maxHealth, "Left", drawBar, drawText);
+		end
+
+		-- кастомные бары
+		local data = self.barData;
+		for i = 1, self.barCount do
+			local item = data[i];
+			local custom = item.spec;
+			n = self:_pushEntry(n, self:_getBarSlot(custom.name), custom, item.value, item.max, "Right", true, custom.text and true or false);
+		end
+	end
+	self.entryCount = n;
+
+	local textSize = self.interface.sharedSettings.textSize;
+	for i = 1, #BAR_SIDES do
+		local side = BAR_SIDES[i];
+		distances[side] = BAR_BASE_OFFSET + mathMax(counts[side] - 1, 0)*BAR_STACK_STEP;
+	end
+	self.topExtent = barExtent(counts.Top, texts.Top, distances.Top, textSize);
+	self.bottomExtent = barExtent(counts.Bottom, texts.Bottom, distances.Bottom, textSize);
+end
+
+function EspObject:HideBar(slot)
+	slot.line.Visible = false;
+	slot.outline.Visible = false;
+	slot.text.Visible = false;
+	slot.glowShow = false;
+	self:HideGradient(slot.segments);
+end
+
+function EspObject:RenderBar(entry, corners)
+	local slot, spec, side = entry.slot, entry.spec, entry.side;
+	local interface = self.interface;
+	local value, max = entry.value, entry.max;
+	local ratio = (max and max > 0) and clamp(value/max, 0, 1) or 0;
+	slot.usedId = self.renderId;
+
+	local topLeft, topRight = corners.topLeft, corners.topRight;
+	local bottomLeft, bottomRight = corners.bottomLeft, corners.bottomRight;
+	local vertical = side == "Left" or side == "Right";
+	local textDistance = self.sideDistance[side];
+	local offset = entry.index > 0 and (BAR_BASE_OFFSET + (entry.index - 1)*BAR_STACK_STEP) or textDistance;
+
+	-- barTo = начало (пусто), barFrom = конец (полный)
+	local barFrom, barTo;
+	if side == "Left" then
+		local shift = Vector2.new(offset, 0);
+		barFrom, barTo = topLeft - shift, bottomLeft - shift;
+	elseif side == "Right" then
+		local shift = Vector2.new(offset, 0);
+		barFrom, barTo = topRight + shift, bottomRight + shift;
+	elseif side == "Top" then
+		local shift = Vector2.new(0, offset);
+		barFrom, barTo = topRight - shift, topLeft - shift;
+	else
+		local shift = Vector2.new(0, offset);
+		barFrom, barTo = bottomRight + shift, bottomLeft + shift;
+	end
+
+	local fillEnd = lerp2(barTo, barFrom, ratio);
+	local tint = lerpColor(spec.dyingColor, spec.healthyColor, ratio);
+
+	if entry.drawBar then
+		local useGradient = spec.gradient;
+		slot.line.Visible = not useGradient;
+		slot.outline.Visible = spec.outline and true or false;
+
+		if useGradient then
+			self:RenderGradient(slot, barFrom, barTo, ratio, spec);
+		else
+			local line = slot.line;
+			line.To = barTo;
+			line.From = fillEnd;
+			line.Color = tint;
+			self:HideGradient(slot.segments);
+		end
+
+		if spec.outline then
+			local outline = slot.outline;
+			if vertical then
+				outline.To = barTo + HEALTH_BAR_OUTLINE_OFFSET;
+				outline.From = barFrom - HEALTH_BAR_OUTLINE_OFFSET;
+			else
+				outline.To = barTo - BAR_OUTLINE_OFFSET_H;
+				outline.From = barFrom + BAR_OUTLINE_OFFSET_H;
+			end
+			outline.Color = parseColor(self, spec.outlineColor[1], true);
+			outline.Transparency = spec.outlineColor[2];
+		end
+
+		slot.glowShow = true;
+		slot.gFrom = barTo;
+		slot.gTo = fillEnd;
+		slot.gTint = tint;
+		slot.gBase = spec.outline and 3 or 1;
+	else
+		slot.line.Visible = false;
+		slot.outline.Visible = false;
+		slot.glowShow = false;
+		self:HideGradient(slot.segments);
+	end
+
+	local text = slot.text;
+	if entry.drawText then
+		text.Visible = true;
+		text.Text = tostring(spec.textFormat and spec.textFormat(value, max) or (round(value) .. (spec.textSuffix or "")));
+		text.Size = interface.sharedSettings.textSize;
+		text.Font = interface.sharedSettings.textFont;
+		text.Color = parseColor(self, spec.textColor[1]);
+		text.Transparency = spec.textColor[2];
+		text.Outline = spec.textOutline;
+		text.OutlineColor = parseColor(self, spec.textOutlineColor, true);
+
+		local half = text.TextBounds*0.5;
+		local gap = HEALTH_TEXT_OFFSET.X;
+		if side == "Left" then
+			text.Position = Vector2.new(topLeft.X - textDistance - gap - half.X, fillEnd.Y - half.Y);
+		elseif side == "Right" then
+			text.Position = Vector2.new(topRight.X + textDistance + gap + half.X, fillEnd.Y - half.Y);
+		elseif side == "Top" then
+			text.Position = Vector2.new(fillEnd.X - half.X, topLeft.Y - textDistance - gap - half.Y);
+		else
+			text.Position = Vector2.new(fillEnd.X - half.X, bottomLeft.Y + textDistance + gap + half.Y);
+		end
+	else
+		text.Visible = false;
+	end
 end
 
 function EspObject:Destruct()
@@ -440,6 +750,11 @@ function EspObject:Update()
 	self.weapon = interface.getWeapon(self.player);
 	self.enabled = self.options.enabled and self.character and not
 		(#interface.whitelist > 0 and not find(interface.whitelist, self.player.UserId));
+
+	self.barCount = 0;
+	if self.enabled then
+		self:UpdateBars();
+	end
 
 	local head = self.enabled and findFirstChild(self.character, "Head");
 	if not head then
@@ -516,54 +831,17 @@ function EspObject:Render()
 		boxFill.Transparency = options.boxFillColor[2];
 	end
 
-	local healthBarVisible = enabled and onScreen and options.healthBar;
-	local useGradient = healthBarVisible and options.healthBarGradient;
-	visible.healthBar.Visible = healthBarVisible and not useGradient;
-	visible.healthBarOutline.Visible = healthBarVisible and options.healthBarOutline;
-	local glowFrom, glowTo, glowTint;
-	if healthBarVisible then
-		local barFrom = corners.topLeft - HEALTH_BAR_OFFSET;
-		local barTo = corners.bottomLeft - HEALTH_BAR_OFFSET;
-		local ratio = clamp(self.health/self.maxHealth, 0, 1);
-		glowFrom, glowTo = barTo, lerp2(barTo, barFrom, ratio);
-		glowTint = lerpColor(options.dyingColor, options.healthyColor, ratio);
-
-		if useGradient then
-			self:RenderGradient(barFrom, barTo, ratio, options);
-		else
-			local healthBar = visible.healthBar;
-			healthBar.To = barTo;
-			healthBar.From = lerp2(barTo, barFrom, ratio);
-			healthBar.Color = lerpColor(options.dyingColor, options.healthyColor, ratio);
+	-- bars: healthBar + кастомные бары (позиция Left / Right / Top / Bottom)
+	self.renderId = self.renderId + 1;
+	self:LayoutBars(enabled and onScreen, options);
+	for i = 1, self.entryCount do
+		self:RenderBar(self.barEntries[i], corners);
+	end
+	for i = 1, #self.barSlots do
+		local slot = self.barSlots[i];
+		if slot.usedId ~= self.renderId then
+			self:HideBar(slot);
 		end
-
-		local healthBarOutline = visible.healthBarOutline;
-		healthBarOutline.To = barTo + HEALTH_BAR_OUTLINE_OFFSET;
-		healthBarOutline.From = barFrom - HEALTH_BAR_OUTLINE_OFFSET;
-		healthBarOutline.Color = parseColor(self, options.healthBarOutlineColor[1], true);
-		healthBarOutline.Transparency = options.healthBarOutlineColor[2];
-	end
-
-	glowLine(self, "healthBar", healthBarVisible and true or false, glowFrom, glowTo, glowTint, 1, options, "healthBar", options.healthBarOutline and 3 or 1);
-
-	if not useGradient and #self.healthBarSegments > 0 then
-		self:HideGradient();
-	end
-
-	visible.healthText.Visible = enabled and onScreen and options.healthText;
-	if visible.healthText.Visible then
-		local barFrom = corners.topLeft - HEALTH_BAR_OFFSET;
-		local barTo = corners.bottomLeft - HEALTH_BAR_OFFSET;
-
-		local healthText = visible.healthText;
-		healthText.Text = round(self.health) .. "hp";
-		healthText.Size = interface.sharedSettings.textSize;
-		healthText.Font = interface.sharedSettings.textFont;
-		healthText.Color = parseColor(self, options.healthTextColor[1]);
-		healthText.Transparency = options.healthTextColor[2];
-		healthText.Outline = options.healthTextOutline;
-		healthText.OutlineColor = parseColor(self, options.healthTextOutlineColor, true);
-		healthText.Position = lerp2(barTo, barFrom, self.health/self.maxHealth) - healthText.TextBounds*0.5 - HEALTH_TEXT_OFFSET;
 	end
 
 	visible.name.Visible = enabled and onScreen and options.name;
@@ -575,7 +853,7 @@ function EspObject:Render()
 		name.Transparency = options.nameColor[2];
 		name.Outline = options.nameOutline;
 		name.OutlineColor = parseColor(self, options.nameOutlineColor, true);
-		name.Position = (corners.topLeft + corners.topRight)*0.5 - Vector2.yAxis*name.TextBounds.Y - NAME_OFFSET;
+		name.Position = (corners.topLeft + corners.topRight)*0.5 - Vector2.yAxis*name.TextBounds.Y - NAME_OFFSET - Vector2.yAxis*self.topExtent;
 	end
 
 	visible.distance.Visible = enabled and onScreen and self.distance and options.distance;
@@ -588,7 +866,7 @@ function EspObject:Render()
 		distance.Transparency = options.distanceColor[2];
 		distance.Outline = options.distanceOutline;
 		distance.OutlineColor = parseColor(self, options.distanceOutlineColor, true);
-		distance.Position = (corners.bottomLeft + corners.bottomRight)*0.5 + DISTANCE_OFFSET;
+		distance.Position = (corners.bottomLeft + corners.bottomRight)*0.5 + DISTANCE_OFFSET + Vector2.yAxis*self.bottomExtent;
 	end
 
 	visible.weapon.Visible = enabled and onScreen and options.weapon;
@@ -602,7 +880,7 @@ function EspObject:Render()
 		weapon.Outline = options.weaponOutline;
 		weapon.OutlineColor = parseColor(self, options.weaponOutlineColor, true);
 		weapon.Position =
-			(corners.bottomLeft + corners.bottomRight)*0.5 +
+			(corners.bottomLeft + corners.bottomRight)*0.5 + Vector2.yAxis*self.bottomExtent +
 			(visible.distance.Visible and DISTANCE_OFFSET + Vector2.yAxis*visible.distance.TextBounds.Y or Vector2.zero);
 	end
 
@@ -678,7 +956,12 @@ function EspObject:Render()
 		local boxFill = visible.boxFill;
 		glowSquare(self, "boxFill", boxFill.Visible, boxFill.Position, boxFill.Size, boxFill.Color, boxFill.Transparency, options, "boxFill", 1, true);
 
-		glowText(self, "healthText", visible.healthText, options, "healthText");
+		for i = 1, #self.barSlots do
+			local slot = self.barSlots[i];
+			glowLine(self, slot.glowBar, slot.glowShow, slot.gFrom, slot.gTo, slot.gTint, 1, options, slot.glowBarElement, slot.gBase);
+			glowText(self, slot.glowText, slot.text, options, slot.glowTextElement);
+		end
+
 		glowText(self, "name", visible.name, options, "name");
 		glowText(self, "distance", visible.distance, options, "distance");
 		glowText(self, "weapon", visible.weapon, options, "weapon");
@@ -1156,6 +1439,11 @@ local EspInterface = {
 			healthBar = false,
 			healthyColor = Color3.new(0,1,0),
 			dyingColor = Color3.new(1,0,0),
+			healthBarPosition = "Left", -- "Left" | "Right" | "Top" | "Bottom" (или "Below")
+			-- кастомные бары, значения берутся из EspInterface.getValue(player, name):
+			-- bars = { { name = "armor", position = "Right", healthyColor = Color3.new(0, 0.6, 1), text = true } },
+			-- либо EspInterface.AddBar("armor", { position = "Right", text = true })
+			bars = {},
 			healthBarGradient = false,
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
@@ -1213,6 +1501,11 @@ local EspInterface = {
 			healthBar = false,
 			healthyColor = Color3.new(0,1,0),
 			dyingColor = Color3.new(1,0,0),
+			healthBarPosition = "Left", -- "Left" | "Right" | "Top" | "Bottom" (или "Below")
+			-- кастомные бары, значения берутся из EspInterface.getValue(player, name):
+			-- bars = { { name = "armor", position = "Right", healthyColor = Color3.new(0, 0.6, 1), text = true } },
+			-- либо EspInterface.AddBar("armor", { position = "Right", text = true })
+			bars = {},
 			healthBarGradient = false,
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
@@ -1264,6 +1557,61 @@ function EspInterface.AddInstance(instance, options)
 	return cache[instance][1];
 end
 
+-- кастомные бары: EspInterface.AddBar(name, config, team)
+-- team = "enemy" | "friendly" (nil = оба). Конфиг (все поля необязательны):
+--   position = "Left" | "Right" | "Top" | "Bottom" (или "Below"), по умолчанию "Right"
+--   healthyColor, dyingColor, gradient, gradientSegments, outline, outlineColor = { Color3, transparency }
+--   text, textColor = { Color3, transparency }, textOutline, textOutlineColor, textSuffix, textFormat = function(value, max)
+--   getValue = function(player, name) return value, max end -- переопределяет EspInterface.getValue
+function EspInterface.AddBar(name, config, team)
+	assert(type(name) == "string", "Missing argument #1 (string expected)");
+
+	local spec = config or {};
+	spec.name = name;
+	spec._normalized = nil;
+	normalizeBar(spec);
+
+	local targets = {};
+	if team then
+		targets[1] = assert(EspInterface.teamSettings[team], "Unknown team (enemy / friendly expected)");
+	else
+		targets[1], targets[2] = EspInterface.teamSettings.enemy, EspInterface.teamSettings.friendly;
+	end
+
+	for i = 1, #targets do
+		local settings = targets[i];
+		settings.bars = settings.bars or {};
+
+		local bars, replaced = settings.bars, false;
+		for j = 1, #bars do
+			if bars[j].name == name then
+				bars[j] = spec;
+				replaced = true;
+				break;
+			end
+		end
+		if not replaced then
+			bars[#bars + 1] = spec;
+		end
+	end
+	return spec;
+end
+
+function EspInterface.RemoveBar(name, team)
+	for _, settings in next, EspInterface.teamSettings do
+		if not team or EspInterface.teamSettings[team] == settings then
+			local bars = settings.bars;
+			if bars then
+				for i = #bars, 1, -1 do
+					if bars[i].name == name then
+						table.remove(bars, i);
+					end
+				end
+			end
+		end
+	end
+end
+
 function EspInterface.Load()
 	assert(not EspInterface._hasLoaded, "Esp has already been loaded.");
 
@@ -1312,6 +1660,12 @@ end
 -- game specific functions
 function EspInterface.getWeapon(player)
 	return "Unknown";
+end
+
+-- значение для кастомных баров: return value, maxValue (nil = бар скрыт)
+-- пример: if name == "armor" then return player.Character.Armor.Value, 100 end
+function EspInterface.getValue(player, name)
+	return nil;
 end
 
 function EspInterface.isFriendly(player)
