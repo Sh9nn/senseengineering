@@ -59,6 +59,19 @@ local VERTICES = {
 	Vector3.new(1, -1, 1)
 };
 
+local GLOW_MAX_LAYERS = 8;
+local GLOW_DIRECTIONS = {
+	Vector2.new(1, 0), Vector2.new(-1, 0), Vector2.new(0, 1), Vector2.new(0, -1),
+	Vector2.new(0.707, 0.707), Vector2.new(-0.707, 0.707), Vector2.new(0.707, -0.707), Vector2.new(-0.707, -0.707)
+};
+local BOX3D_GLOW_KEYS = {};
+for i = 1, 4 do
+	BOX3D_GLOW_KEYS[i] = {};
+	for j = 1, 3 do
+		BOX3D_GLOW_KEYS[i][j] = "box3d" .. i .. "_" .. j;
+	end
+end
+
 -- functions
 local function isBodyPart(name)
 	return name == "Head" or name:find("Torso") or name:find("Leg") or name:find("Arm");
@@ -114,6 +127,187 @@ local function parseColor(self, color, isOutline)
 	return color;
 end
 
+-- glow (Drawing API не умеет blur, поэтому свечение = несколько полупрозрачных слоёв позади элемента)
+local function glowAllowed(options, element)
+	if not options.glow then
+		return false;
+	end
+	local elements = options.glowElements;
+	return not elements or elements[element] ~= false;
+end
+
+local function getGlowPool(store, key, class, count)
+	local pool = store[key];
+	if not pool then
+		pool = {};
+		store[key] = pool;
+	end
+
+	for i = #pool + 1, count do
+		local drawing = Drawing.new(class);
+		pcall(function()
+			drawing.ZIndex = 0;
+			drawing.Visible = false;
+			if class == "Text" then
+				drawing.Center = true;
+				drawing.Outline = false;
+			end
+		end);
+		pool[i] = drawing;
+	end
+	return pool;
+end
+
+-- возвращает пул drawing'ов и число слоёв (0 = свечение не нужно, лишнее скрывается)
+local function prepareGlow(self, key, class, show, options, element, perLayer)
+	perLayer = perLayer or 1;
+
+	local layers = 0;
+	if show and glowAllowed(options, element) then
+		local requested = perLayer > 1 and (options.glowTextLayers or 1) or (options.glowLayers or 3);
+		layers = clamp(floor(requested), 0, GLOW_MAX_LAYERS);
+	end
+
+	local store = self.glowStore;
+	local needed = layers*perLayer;
+	local pool = store[key];
+	if needed > 0 then
+		pool = getGlowPool(store, key, class, needed);
+	end
+
+	if pool then
+		for i = needed + 1, #pool do
+			pool[i].Visible = false;
+		end
+	end
+	return pool, layers;
+end
+
+local function hideAllGlow(store)
+	for _, pool in next, store do
+		for i = 1, #pool do
+			pool[i].Visible = false;
+		end
+	end
+end
+
+local function destroyGlow(store)
+	for key, pool in next, store do
+		for i = 1, #pool do
+			pool[i]:Remove();
+		end
+		store[key] = nil;
+	end
+end
+
+local function glowColorOf(self, options, fallback)
+	local color = options.glowColor;
+	if color == nil then
+		return fallback;
+	end
+	return parseColor(self, color);
+end
+
+local function layerAlpha(transparency, options, layers)
+	return clamp((transparency or 1)*(options.glowIntensity or 0.6)/layers, 0, 1);
+end
+
+local function glowLine(self, key, show, from, to, color, transparency, options, element, base)
+	local pool, layers = prepareGlow(self, key, "Line", show, options, element);
+	if layers == 0 then
+		return;
+	end
+
+	local size = options.glowSize or 2;
+	local glowColor = glowColorOf(self, options, color);
+	local alpha = layerAlpha(transparency, options, layers);
+	for i = 1, layers do
+		local drawing = pool[i];
+		drawing.From = from;
+		drawing.To = to;
+		drawing.Thickness = base + i*size*2;
+		drawing.Color = glowColor;
+		drawing.Transparency = alpha;
+		drawing.Visible = true;
+	end
+end
+
+local function glowSquare(self, key, show, position, size, color, transparency, options, element, base, filled)
+	local pool, layers = prepareGlow(self, key, "Square", show, options, element);
+	if layers == 0 then
+		return;
+	end
+
+	local step = options.glowSize or 2;
+	local glowColor = glowColorOf(self, options, color);
+	local alpha = layerAlpha(transparency, options, layers);
+	for i = 1, layers do
+		local drawing = pool[i];
+		drawing.Filled = filled or false;
+		if filled then
+			drawing.Position = position - Vector2.one*i*step;
+			drawing.Size = size + Vector2.one*i*step*2;
+		else
+			drawing.Position = position;
+			drawing.Size = size;
+			drawing.Thickness = base + i*step*2;
+		end
+		drawing.Color = glowColor;
+		drawing.Transparency = alpha;
+		drawing.Visible = true;
+	end
+end
+
+local function glowTriangle(self, key, show, a, b, c, color, transparency, options, element, base)
+	local pool, layers = prepareGlow(self, key, "Triangle", show, options, element);
+	if layers == 0 then
+		return;
+	end
+
+	local size = options.glowSize or 2;
+	local glowColor = glowColorOf(self, options, color);
+	local alpha = layerAlpha(transparency, options, layers);
+	for i = 1, layers do
+		local drawing = pool[i];
+		drawing.PointA = a;
+		drawing.PointB = b;
+		drawing.PointC = c;
+		drawing.Filled = false;
+		drawing.Thickness = base + i*size*2;
+		drawing.Color = glowColor;
+		drawing.Transparency = alpha;
+		drawing.Visible = true;
+	end
+end
+
+-- текст: копии с оффсетом в 8 направлениях на каждый слой
+local function glowText(self, key, main, options, element)
+	local perLayer = #GLOW_DIRECTIONS;
+	local pool, layers = prepareGlow(self, key, "Text", main.Visible, options, element, perLayer);
+	if layers == 0 then
+		return;
+	end
+
+	local step = (options.glowSize or 2)*0.5;
+	local glowColor = glowColorOf(self, options, main.Color);
+	local alpha = layerAlpha(main.Transparency, options, layers);
+	local text, size, font, position = main.Text, main.Size, main.Font, main.Position;
+	for layer = 1, layers do
+		for d = 1, perLayer do
+			local drawing = pool[(layer - 1)*perLayer + d];
+			drawing.Text = text;
+			drawing.Size = size;
+			drawing.Font = font;
+			drawing.Center = true;
+			drawing.Outline = false;
+			drawing.Position = position + GLOW_DIRECTIONS[d]*layer*step;
+			drawing.Color = glowColor;
+			drawing.Transparency = alpha;
+			drawing.Visible = true;
+		end
+	end
+end
+
 -- esp object
 local EspObject = {};
 EspObject.__index = EspObject;
@@ -128,6 +322,7 @@ end
 
 function EspObject:_create(class, properties)
 	local drawing = Drawing.new(class);
+	pcall(function() drawing.ZIndex = 1; end);
 	for property, value in next, properties do
 		pcall(function() drawing[property] = value; end);
 	end
@@ -140,6 +335,7 @@ function EspObject:Construct()
 	self.childCount = 0;
 	self.bin = {};
 	self.healthBarSegments = {};
+	self.glowStore = {};
 	self.drawings = {
 		box3d = {
 			{
@@ -231,6 +427,7 @@ function EspObject:Destruct()
 		self.bin[i]:Remove();
 	end
 
+	destroyGlow(self.glowStore);
 	clear(self);
 end
 
@@ -323,10 +520,13 @@ function EspObject:Render()
 	local useGradient = healthBarVisible and options.healthBarGradient;
 	visible.healthBar.Visible = healthBarVisible and not useGradient;
 	visible.healthBarOutline.Visible = healthBarVisible and options.healthBarOutline;
+	local glowFrom, glowTo, glowTint;
 	if healthBarVisible then
 		local barFrom = corners.topLeft - HEALTH_BAR_OFFSET;
 		local barTo = corners.bottomLeft - HEALTH_BAR_OFFSET;
 		local ratio = clamp(self.health/self.maxHealth, 0, 1);
+		glowFrom, glowTo = barTo, lerp2(barTo, barFrom, ratio);
+		glowTint = lerpColor(options.dyingColor, options.healthyColor, ratio);
 
 		if useGradient then
 			self:RenderGradient(barFrom, barTo, ratio, options);
@@ -343,6 +543,8 @@ function EspObject:Render()
 		healthBarOutline.Color = parseColor(self, options.healthBarOutlineColor[1], true);
 		healthBarOutline.Transparency = options.healthBarOutlineColor[2];
 	end
+
+	glowLine(self, "healthBar", healthBarVisible and true or false, glowFrom, glowTo, glowTint, 1, options, "healthBar", options.healthBarOutline and 3 or 1);
 
 	if not useGradient and #self.healthBarSegments > 0 then
 		self:HideGradient();
@@ -465,6 +667,36 @@ function EspObject:Render()
 			line3.To = corners.corners[i == 4 and 8 or i+4];
 		end
 	end
+
+	-- glow
+	if options.glow or self.glowActive then
+		self.glowActive = options.glow and true or false;
+
+		local box = visible.box;
+		glowSquare(self, "box", box.Visible, box.Position, box.Size, box.Color, box.Transparency, options, "box", options.boxOutline and 3 or 1, false);
+
+		local boxFill = visible.boxFill;
+		glowSquare(self, "boxFill", boxFill.Visible, boxFill.Position, boxFill.Size, boxFill.Color, boxFill.Transparency, options, "boxFill", 1, true);
+
+		glowText(self, "healthText", visible.healthText, options, "healthText");
+		glowText(self, "name", visible.name, options, "name");
+		glowText(self, "distance", visible.distance, options, "distance");
+		glowText(self, "weapon", visible.weapon, options, "weapon");
+
+		local tracer = visible.tracer;
+		glowLine(self, "tracer", tracer.Visible, tracer.From, tracer.To, tracer.Color, tracer.Transparency, options, "tracer", options.tracerOutline and 3 or 1);
+
+		local arrow = hidden.arrow;
+		glowTriangle(self, "arrow", arrow.Visible and self.direction ~= nil, arrow.PointA, arrow.PointB, arrow.PointC, arrow.Color, arrow.Transparency, options, "arrow", options.offScreenArrowOutline and 3 or 1);
+
+		for i = 1, #box3d do
+			local face = box3d[i];
+			for i2 = 1, #face do
+				local line = face[i2];
+				glowLine(self, BOX3D_GLOW_KEYS[i][i2], box3dEnabled, line.From, line.To, line.Color, line.Transparency, options, "box3d", 1);
+			end
+		end
+	end
 end
 
 -- cham object
@@ -577,6 +809,14 @@ function InstanceObject:Construct()
 	options.limitDistance = options.limitDistance or false;
 	options.maxDistance = options.maxDistance or 150;
 
+	-- glow
+	options.glow = options.glow or false;
+	options.glowLayers = options.glowLayers or 3;
+	options.glowSize = options.glowSize or 2;
+	options.glowIntensity = options.glowIntensity or 0.6;
+	options.glowTextLayers = options.glowTextLayers or 1;
+	self.glowStore = {};
+
 	-- text drawing (кастомный текст)
 	self.text = Drawing.new("Text");
 	self.text.Center = true;
@@ -625,6 +865,20 @@ function InstanceObject:Construct()
 	self.tracerDrawing.Thickness = 1;
 	self.tracerDrawing.Visible = false;
 
+	-- ZIndex: основные элементы над свечением
+	local mainDrawings = {
+		self.text, self.nameDrawing, self.distanceDrawing, self.boxOutlineDrawing, self.boxDrawing,
+		self.boxFillDrawing, self.tracerOutlineDrawing, self.tracerDrawing
+	};
+	for i = 1, 4 do
+		for j = 1, 3 do
+			mainDrawings[#mainDrawings + 1] = self.box3dDrawings[i][j];
+		end
+	end
+	for i = 1, #mainDrawings do
+		pcall(function() mainDrawings[i].ZIndex = 1; end);
+	end
+
 	-- chams highlight
 	self.highlight = Instance.new("Highlight", container);
 	self.highlight.Enabled = false;
@@ -645,6 +899,7 @@ function InstanceObject:Destruct()
 	self.tracerDrawing:Remove();
 	self.tracerOutlineDrawing:Remove();
 	self.highlight:Destroy();
+	destroyGlow(self.glowStore);
 
 	for i = 1, 4 do
 		for j = 1, 3 do
@@ -672,6 +927,7 @@ function InstanceObject:Render()
 		self.tracerDrawing.Visible = false;
 		self.tracerOutlineDrawing.Visible = false;
 		self.highlight.Enabled = false;
+		hideAllGlow(self.glowStore);
 		for i = 1, 4 do
 			for j = 1, 3 do
 				self.box3dDrawings[i][j].Visible = false;
@@ -841,6 +1097,31 @@ function InstanceObject:Render()
 		tracerOutline.To = tracer.To;
 		tracerOutline.From = tracer.From;
 	end
+
+	-- glow
+	if options.glow or self.glowActive then
+		self.glowActive = options.glow and true or false;
+
+		glowText(self, "text", text, options, "text");
+		glowText(self, "name", self.nameDrawing, options, "name");
+		glowText(self, "distance", self.distanceDrawing, options, "distance");
+
+		local box = self.boxDrawing;
+		glowSquare(self, "box", box.Visible, box.Position, box.Size, box.Color, box.Transparency, options, "box", options.boxOutline and 3 or 1, false);
+
+		local boxFill = self.boxFillDrawing;
+		glowSquare(self, "boxFill", boxFill.Visible, boxFill.Position, boxFill.Size, boxFill.Color, boxFill.Transparency, options, "boxFill", 1, true);
+
+		local tracer = self.tracerDrawing;
+		glowLine(self, "tracer", tracer.Visible, tracer.From, tracer.To, tracer.Color, tracer.Transparency, options, "tracer", options.tracerOutline and 3 or 1);
+
+		for i = 1, 4 do
+			for j = 1, 3 do
+				local line = self.box3dDrawings[i][j];
+				glowLine(self, BOX3D_GLOW_KEYS[i][j], box3dEnabled, line.From, line.To, line.Color, line.Transparency, options, "box3d", 1);
+			end
+		end
+	end
 end
 
 -- interface
@@ -858,6 +1139,14 @@ local EspInterface = {
 	teamSettings = {
 		enemy = {
 			enabled = false,
+			glow = false,
+			glowLayers = 3,
+			glowSize = 2,
+			glowIntensity = 0.6,
+			glowTextLayers = 1,
+			-- glowColor = Color3.new(1, 1, 1), -- необязательно; по умолчанию цвет самого элемента
+			-- glowElements = { box = true, boxFill = true, box3d = true, healthBar = true, healthText = true,
+			--                  name = true, distance = true, weapon = true, tracer = true, arrow = true };
 			box = false,
 			boxColor = { Color3.new(1,0,0), 1 },
 			boxOutline = true,
@@ -907,6 +1196,14 @@ local EspInterface = {
 		},
 		friendly = {
 			enabled = false,
+			glow = false,
+			glowLayers = 3,
+			glowSize = 2,
+			glowIntensity = 0.6,
+			glowTextLayers = 1,
+			-- glowColor = Color3.new(1, 1, 1), -- необязательно; по умолчанию цвет самого элемента
+			-- glowElements = { box = true, boxFill = true, box3d = true, healthBar = true, healthText = true,
+			--                  name = true, distance = true, weapon = true, tracer = true, arrow = true };
 			box = false,
 			boxColor = { Color3.new(0,1,0), 1 },
 			boxOutline = true,
