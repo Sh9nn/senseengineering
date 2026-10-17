@@ -51,6 +51,7 @@ local BAR_OUTLINE_OFFSET_H = Vector2.new(1, 0);
 local BAR_SIDES = { "Left", "Right", "Top", "Bottom" };
 local TEXT_RIGHT_GAP = 4;      -- отступ кастомного текста от бокса / баров справа
 local TEXT_LINE_GAP = 1;       -- расстояние между строками кастомного текста
+local TEXT_MIN_SIZE = 8;       -- минимальный размер кастомного текста при масштабировании
 local GRADIENT_DEFAULT_SEGMENTS = 16;
 local GRADIENT_MAX_SEGMENTS = 64;
 local DISTANCE_OFFSET = Vector2.new(0, 2);
@@ -70,6 +71,12 @@ local GLOW_DIRECTIONS = {
 	Vector2.new(1, 0), Vector2.new(-1, 0), Vector2.new(0, 1), Vector2.new(0, -1),
 	Vector2.new(0.707, 0.707), Vector2.new(-0.707, 0.707), Vector2.new(0.707, -0.707), Vector2.new(-0.707, -0.707)
 };
+local CORNER_NAMES = { "topLeft", "topRight", "bottomLeft", "bottomRight" };
+local CORNER_SIGNS = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 } };
+local CORNER_GLOW_KEYS = {};
+for i = 1, 8 do
+	CORNER_GLOW_KEYS[i] = "cornerBox" .. i;
+end
 local BOX3D_GLOW_KEYS = {};
 for i = 1, 4 do
 	BOX3D_GLOW_KEYS[i] = {};
@@ -314,6 +321,43 @@ local function glowText(self, key, main, options, element)
 	end
 end
 
+-- corner box: 4 уголка по 2 линии (+ 8 линий обводки), общий для EspObject и InstanceObject
+local function renderCornerBox(self, show, corners, options, color, transparency, outlineColor, outlineTransparency)
+	local lines, outlines = self.cornerLines, self.cornerOutlines;
+	if not show then
+		for i = 1, 8 do
+			lines[i].Visible = false;
+			outlines[i].Visible = false;
+		end
+		return;
+	end
+
+	local showOutline = options.cornerBoxOutline and true or false;
+	local width = corners.topRight.X - corners.topLeft.X;
+	local height = corners.bottomLeft.Y - corners.topLeft.Y;
+	local length = mathMin(width*clamp(options.cornerBoxLength or 0.25, 0, 0.5), height*0.5);
+
+	for i = 1, 4 do
+		local point = corners[CORNER_NAMES[i]];
+		local sx, sy = CORNER_SIGNS[i][1], CORNER_SIGNS[i][2];
+		local dx, dy = Vector2.new(sx*length, 0), Vector2.new(0, sy*length);
+
+		local h, v = lines[i*2 - 1], lines[i*2];
+		h.From, h.To = point, point + dx;
+		v.From, v.To = point, point + dy;
+		h.Color, v.Color = color, color;
+		h.Transparency, v.Transparency = transparency, transparency;
+		h.Visible, v.Visible = true, true;
+
+		local oh, ov = outlines[i*2 - 1], outlines[i*2];
+		oh.From, oh.To = point - Vector2.new(sx, 0), point + dx + Vector2.new(sx, 0);
+		ov.From, ov.To = point - Vector2.new(0, sy), point + dy + Vector2.new(0, sy);
+		oh.Color, ov.Color = outlineColor, outlineColor;
+		oh.Transparency, ov.Transparency = outlineTransparency, outlineTransparency;
+		oh.Visible, ov.Visible = showOutline, showOutline;
+	end
+end
+
 -- bars
 local function normalizeSide(position, default)
 	if position == "Left" or position == "Right" or position == "Top" or position == "Bottom" then
@@ -429,6 +473,16 @@ function EspObject:Construct()
 			arrow = self:_create("Triangle", { Filled = true, Visible = false })
 		}
 	};
+
+	-- corner box
+	self.cornerOutlines = {};
+	self.cornerLines = {};
+	for i = 1, 8 do
+		self.cornerOutlines[i] = self:_create("Line", { Thickness = 3, Visible = false });
+	end
+	for i = 1, 8 do
+		self.cornerLines[i] = self:_create("Line", { Thickness = 1, Visible = false });
+	end
 
 	-- bars state
 	self.healthSpec = {};
@@ -609,12 +663,17 @@ function EspObject:_getTextSlot(name)
 end
 
 -- стек кастомных текстов: каждый следующий видимый текст ниже предыдущего,
--- всё сдвигается правее, если справа есть бары (и их текст)
+-- всё сдвигается правее, если справа есть бары (и их текст).
+-- Если стек не влезает в высоту бокса (игрок далеко), размер текста уменьшается,
+-- чтобы он не уезжал вниз (отключается: scale = false, минимум: minSize)
 function EspObject:RenderTexts(active, corners)
 	local renderId = self.renderId;
 
 	if active and self.textCount > 0 then
 		local interface = self.interface;
+		local shared = interface.sharedSettings;
+		local data = self.textData;
+
 		local extent = 0;
 		if self.sideText.Right then
 			extent = self.sideDistance.Right + HEALTH_TEXT_OFFSET.X + self.rightTextWidth + 2;
@@ -624,19 +683,54 @@ function EspObject:RenderTexts(active, corners)
 
 		local x = corners.topRight.X + extent + TEXT_RIGHT_GAP;
 		local y = corners.topRight.Y;
-		local data = self.textData;
+		local boxHeight = corners.bottomLeft.Y - corners.topLeft.Y;
 
+		-- 1) высота стека при базовом размере (замер кешируется, пока не изменится текст/размер/шрифт)
+		local total = 0;
 		for i = 1, self.textCount do
 			local item = data[i];
 			local spec = item.spec;
 			local slot = self:_getTextSlot(spec.name);
+			local drawing = slot.drawing;
+
+			item.slot = slot;
+			item.baseSize = spec.size or shared.textSize;
+			item.font = spec.font or shared.textFont;
+
+			if slot.measuredText ~= item.text or slot.measuredSize ~= item.baseSize or slot.measuredFont ~= item.font then
+				drawing.Text = item.text;
+				drawing.Size = item.baseSize;
+				drawing.Font = item.font;
+				slot.baseHeight = drawing.TextBounds.Y;
+				slot.measuredText, slot.measuredSize, slot.measuredFont = item.text, item.baseSize, item.font;
+			end
+
+			total = total + slot.baseHeight + (spec.spacing or TEXT_LINE_GAP);
+		end
+
+		local scale = 1;
+		if total > boxHeight and total > 0 then
+			scale = mathMax(boxHeight, 0)/total;
+		end
+
+		-- 2) отрисовка
+		for i = 1, self.textCount do
+			local item = data[i];
+			local spec = item.spec;
+			local slot = item.slot;
 			slot.usedId = renderId;
+
+			local size = item.baseSize;
+			if scale < 1 and spec.scale ~= false then
+				local scaled = floor(size*scale + 0.5);
+				size = mathMin(size, mathMax(spec.minSize or TEXT_MIN_SIZE, scaled));
+			end
 
 			local drawing = slot.drawing;
 			drawing.Visible = true;
 			drawing.Text = item.text;
-			drawing.Size = spec.size or interface.sharedSettings.textSize;
-			drawing.Font = spec.font or interface.sharedSettings.textFont;
+			drawing.Size = size;
+			drawing.Font = item.font;
 			drawing.Color = parseColor(self, spec.color[1]);
 			drawing.Transparency = spec.color[2];
 			drawing.Outline = spec.outline;
@@ -842,9 +936,9 @@ function EspObject:RenderBar(entry, corners)
 		elseif side == "Right" then
 			text.Position = Vector2.new(topRight.X + textDistance + gap + half.X, fillEnd.Y - half.Y);
 		elseif side == "Top" then
-			text.Position = Vector2.new(fillEnd.X - half.X, topLeft.Y - textDistance - gap - half.Y*2);
+			text.Position = Vector2.new(fillEnd.X + gap + half.X, topLeft.Y - textDistance - gap - half.Y*2);
 		else
-			text.Position = Vector2.new(fillEnd.X - half.X, bottomLeft.Y + textDistance + gap);
+			text.Position = Vector2.new(fillEnd.X + gap + half.X, bottomLeft.Y + textDistance + gap);
 		end
 	else
 		text.Visible = false;
@@ -952,6 +1046,16 @@ function EspObject:Render()
 		boxFill.Size = corners.bottomRight - corners.topLeft;
 		boxFill.Color = parseColor(self, options.boxFillColor[1]);
 		boxFill.Transparency = options.boxFillColor[2];
+	end
+
+	if enabled and onScreen and options.cornerBox then
+		renderCornerBox(
+			self, true, corners, options,
+			parseColor(self, options.cornerBoxColor[1]), options.cornerBoxColor[2],
+			parseColor(self, options.cornerBoxOutlineColor[1], true), options.cornerBoxOutlineColor[2]
+		);
+	else
+		renderCornerBox(self, false);
 	end
 
 	-- bars: healthBar + кастомные бары (позиция Left / Right / Top / Bottom)
@@ -1108,6 +1212,11 @@ function EspObject:Render()
 				glowLine(self, BOX3D_GLOW_KEYS[i][i2], box3dEnabled, line.From, line.To, line.Color, line.Transparency, options, "box3d", 1);
 			end
 		end
+
+		for i = 1, 8 do
+			local line = self.cornerLines[i];
+			glowLine(self, CORNER_GLOW_KEYS[i], line.Visible, line.From, line.To, line.Color, line.Transparency, options, "cornerBox", options.cornerBoxOutline and 3 or 1);
+		end
 	end
 end
 
@@ -1204,6 +1313,13 @@ function InstanceObject:Construct()
 	options.box3d = options.box3d or false;
 	options.box3dColor = options.box3dColor or { Color3.new(1,1,1), 1 };
 
+	-- corner box
+	options.cornerBox = options.cornerBox or false;
+	options.cornerBoxColor = options.cornerBoxColor or { Color3.new(1,1,1), 1 };
+	options.cornerBoxOutline = options.cornerBoxOutline == nil and true or options.cornerBoxOutline;
+	options.cornerBoxOutlineColor = options.cornerBoxOutlineColor or { Color3.new(), 1 };
+	options.cornerBoxLength = options.cornerBoxLength or 0.25;
+
 	-- tracer
 	options.tracer = options.tracer or false;
 	options.tracerOrigin = options.tracerOrigin or "Bottom";
@@ -1256,6 +1372,22 @@ function InstanceObject:Construct()
 	self.boxFillDrawing.Filled = true;
 	self.boxFillDrawing.Visible = false;
 
+	-- corner box drawings
+	self.cornerOutlines = {};
+	self.cornerLines = {};
+	for i = 1, 8 do
+		local outline = Drawing.new("Line");
+		outline.Thickness = 3;
+		outline.Visible = false;
+		self.cornerOutlines[i] = outline;
+	end
+	for i = 1, 8 do
+		local line = Drawing.new("Line");
+		line.Thickness = 1;
+		line.Visible = false;
+		self.cornerLines[i] = line;
+	end
+
 	-- box3d drawings (4 грани по 3 линии)
 	self.box3dDrawings = {};
 	for i = 1, 4 do
@@ -1287,6 +1419,10 @@ function InstanceObject:Construct()
 			mainDrawings[#mainDrawings + 1] = self.box3dDrawings[i][j];
 		end
 	end
+	for i = 1, 8 do
+		mainDrawings[#mainDrawings + 1] = self.cornerOutlines[i];
+		mainDrawings[#mainDrawings + 1] = self.cornerLines[i];
+	end
 	for i = 1, #mainDrawings do
 		pcall(function() mainDrawings[i].ZIndex = 1; end);
 	end
@@ -1312,6 +1448,10 @@ function InstanceObject:Destruct()
 	self.tracerOutlineDrawing:Remove();
 	self.highlight:Destroy();
 	destroyGlow(self.glowStore);
+	for i = 1, 8 do
+		self.cornerOutlines[i]:Remove();
+		self.cornerLines[i]:Remove();
+	end
 
 	for i = 1, 4 do
 		for j = 1, 3 do
@@ -1340,6 +1480,10 @@ function InstanceObject:Render()
 		self.tracerOutlineDrawing.Visible = false;
 		self.highlight.Enabled = false;
 		hideAllGlow(self.glowStore);
+		for i = 1, 8 do
+			self.cornerOutlines[i].Visible = false;
+			self.cornerLines[i].Visible = false;
+		end
 		for i = 1, 4 do
 			for j = 1, 3 do
 				self.box3dDrawings[i][j].Visible = false;
@@ -1462,6 +1606,13 @@ function InstanceObject:Render()
 		boxFill.Transparency = options.boxFillColor[2];
 	end
 
+	-- corner box
+	renderCornerBox(
+		self, visible and options.cornerBox, corners, options,
+		options.cornerBoxColor[1], options.cornerBoxColor[2],
+		options.cornerBoxOutlineColor[1], options.cornerBoxOutlineColor[2]
+	);
+
 	-- box3d
 	local box3dEnabled = visible and options.box3d;
 	for i = 1, 4 do
@@ -1533,6 +1684,11 @@ function InstanceObject:Render()
 				glowLine(self, BOX3D_GLOW_KEYS[i][j], box3dEnabled, line.From, line.To, line.Color, line.Transparency, options, "box3d", 1);
 			end
 		end
+
+		for i = 1, 8 do
+			local line = self.cornerLines[i];
+			glowLine(self, CORNER_GLOW_KEYS[i], line.Visible, line.From, line.To, line.Color, line.Transparency, options, "cornerBox", options.cornerBoxOutline and 3 or 1);
+		end
 	end
 end
 
@@ -1557,12 +1713,17 @@ local EspInterface = {
 			glowIntensity = 0.6,
 			glowTextLayers = 1,
 			-- glowColor = Color3.new(1, 1, 1), -- необязательно; по умолчанию цвет самого элемента
-			-- glowElements = { box = true, boxFill = true, box3d = true, healthBar = true, healthText = true,
+			-- glowElements = { box = true, boxFill = true, box3d = true, cornerBox = true, healthBar = true, healthText = true,
 			--                  name = true, distance = true, weapon = true, tracer = true, arrow = true };
 			box = false,
 			boxColor = { Color3.new(1,0,0), 1 },
 			boxOutline = true,
 			boxOutlineColor = { Color3.new(), 1 },
+			cornerBox = false,
+			cornerBoxColor = { Color3.new(1,0,0), 1 },
+			cornerBoxOutline = true,
+			cornerBoxOutlineColor = { Color3.new(), 1 },
+			cornerBoxLength = 0.25, -- длина уголка (доля ширины бокса, максимум 0.5)
 			boxFill = false,
 			boxFillColor = { Color3.new(1,0,0), 0.5 },
 			healthBar = false,
@@ -1623,12 +1784,17 @@ local EspInterface = {
 			glowIntensity = 0.6,
 			glowTextLayers = 1,
 			-- glowColor = Color3.new(1, 1, 1), -- необязательно; по умолчанию цвет самого элемента
-			-- glowElements = { box = true, boxFill = true, box3d = true, healthBar = true, healthText = true,
+			-- glowElements = { box = true, boxFill = true, box3d = true, cornerBox = true, healthBar = true, healthText = true,
 			--                  name = true, distance = true, weapon = true, tracer = true, arrow = true };
 			box = false,
 			boxColor = { Color3.new(0,1,0), 1 },
 			boxOutline = true,
 			boxOutlineColor = { Color3.new(), 1 },
+			cornerBox = false,
+			cornerBoxColor = { Color3.new(0,1,0), 1 },
+			cornerBoxOutline = true,
+			cornerBoxOutlineColor = { Color3.new(), 1 },
+			cornerBoxLength = 0.25, -- длина уголка (доля ширины бокса, максимум 0.5)
 			boxFill = false,
 			boxFillColor = { Color3.new(0,1,0), 0.5 },
 			healthBar = false,
@@ -1760,6 +1926,7 @@ end
 -- кастомные тексты справа от бокса: EspInterface.AddText(name, config, team)
 -- Конфиг (все поля необязательны):
 --   color = { Color3, transparency }, outline, outlineColor, size, font, spacing
+--   scale = false -- не уменьшать размер, когда стек не влезает в бокс; minSize = 8 -- нижний предел размера
 --   text = "строка" -- статичный текст (вместо getText)
 --   getText = function(player, name) return "30/90" end -- переопределяет EspInterface.getText
 -- Текст nil или "" = строка скрыта, следующие поднимаются вверх
