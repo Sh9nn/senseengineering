@@ -389,7 +389,7 @@ local function normalizeBar(spec)
 	spec.dyingColor = spec.dyingColor or Color3.new(1, 0, 0);
 	spec.gradient = spec.gradient or false;
 	spec.gradientSegments = spec.gradientSegments or GRADIENT_DEFAULT_SEGMENTS;
-	spec.text = spec.text or false;
+	spec.text = spec.text == nil and true or spec.text;
 	spec.textColor = spec.textColor or { Color3.new(1, 1, 1), 1 };
 	spec.textOutline = spec.textOutline == nil and true or spec.textOutline;
 	spec.textOutlineColor = spec.textOutlineColor or Color3.new();
@@ -809,8 +809,8 @@ function EspObject:LayoutBars(active, options)
 		spec.textSuffix = "";
 
 		local drawBar = spec.enabled and true or false;
-		local drawText = spec.text and true or false;
-		if drawBar or drawText then
+		local drawText = drawBar and spec.text and true or false;
+		if drawBar then
 			n = self:_pushEntry(n, self.mainSlot, spec, self.health, self.maxHealth, "Left", drawBar, drawText);
 		end
 
@@ -1727,7 +1727,7 @@ local EspInterface = {
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
 			healthBarOutlineColor = { Color3.new(), 0.5 },
-			healthText = false,
+			healthText = true, -- число HP на краю заливки (только если HP не полное), работает вместе с healthBar
 			healthTextColor = { Color3.new(1,1,1), 1 },
 			healthTextOutline = true,
 			healthTextOutlineColor = Color3.new(),
@@ -1799,7 +1799,7 @@ local EspInterface = {
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
 			healthBarOutlineColor = { Color3.new(), 0.5 },
-			healthText = false,
+			healthText = true, -- число HP на краю заливки (только если HP не полное), работает вместе с healthBar
 			healthTextColor = { Color3.new(1,1,1), 1 },
 			healthTextOutline = true,
 			healthTextOutlineColor = Color3.new(),
@@ -1851,7 +1851,7 @@ end
 -- team = "enemy" | "friendly" (nil = оба). Конфиг (все поля необязательны):
 --   position = "Left" | "Right" | "Top" | "Bottom" (или "Below"), по умолчанию "Right"
 --   healthyColor, dyingColor, gradient, gradientSegments, outline, outlineColor = { Color3, transparency }
---   text (число на краю заливки, показывается только если бар не полный), textColor = { Color3, transparency },
+--   text (по умолчанию true; число на краю заливки, показывается только если бар не полный), textColor = { Color3, transparency },
 --   textOutline, textOutlineColor, textSuffix, textFormat = function(value, max)
 --   getValue = function(player, name) return value, max end -- переопределяет EspInterface.getValue
 local function addSpec(listName, normalize, name, config, team)
