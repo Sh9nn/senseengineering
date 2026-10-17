@@ -294,9 +294,9 @@ local function glowTriangle(self, key, show, a, b, c, color, transparency, optio
 end
 
 -- текст: копии с оффсетом в 8 направлениях на каждый слой
-local function glowText(self, key, main, options, element)
+local function glowText(self, key, main, options, element, allow)
 	local perLayer = #GLOW_DIRECTIONS;
-	local pool, layers = prepareGlow(self, key, "Text", main.Visible, options, element, perLayer);
+	local pool, layers = prepareGlow(self, key, "Text", main.Visible and allow ~= false, options, element, perLayer);
 	if layers == 0 then
 		return;
 	end
@@ -837,6 +837,7 @@ function EspObject:HideBar(slot)
 	slot.outline.Visible = false;
 	slot.text.Visible = false;
 	slot.glowShow = false;
+	slot.smooth = nil;
 	self:HideGradient(slot.segments);
 end
 
@@ -845,7 +846,26 @@ function EspObject:RenderBar(entry, corners)
 	local interface = self.interface;
 	local value, max = entry.value, entry.max;
 	local ratio = (max and max > 0) and clamp(value/max, 0, 1) or 0;
+	local actualRatio = ratio;
 	slot.usedId = self.renderId;
+
+	-- smoothBars: отображаемое значение плавно догоняет реальное
+	local alpha = self.smoothAlpha;
+	if alpha then
+		local shown = slot.smooth;
+		if shown == nil then
+			shown = ratio;
+		else
+			shown = shown + (ratio - shown)*alpha;
+			if math.abs(ratio - shown) < 0.0005 then
+				shown = ratio;
+			end
+		end
+		slot.smooth = shown;
+		ratio = shown;
+	else
+		slot.smooth = nil;
+	end
 
 	local topLeft, topRight = corners.topLeft, corners.topRight;
 	local bottomLeft, bottomRight = corners.bottomLeft, corners.bottomRight;
@@ -914,9 +934,10 @@ function EspObject:RenderBar(entry, corners)
 
 	-- текст: только число, прямо на краю заливки; виден только если бар не полный
 	local text = slot.text;
-	if entry.drawText and ratio < 1 then
+	if entry.drawText and (actualRatio < 1 or ratio < 0.995) then
+		local textValue = alpha and ratio*(max or 0) or value;
 		text.Visible = true;
-		text.Text = tostring(spec.textFormat and spec.textFormat(value, max) or (round(value) .. (spec.textSuffix or "")));
+		text.Text = tostring(spec.textFormat and spec.textFormat(textValue, max) or (round(textValue) .. (spec.textSuffix or "")));
 		text.Size = interface.sharedSettings.textSize;
 		text.Font = interface.sharedSettings.textFont;
 		text.Color = parseColor(self, spec.textColor[1]);
@@ -997,7 +1018,7 @@ function EspObject:Update()
 	end
 end
 
-function EspObject:Render()
+function EspObject:Render(deltaTime)
 	local onScreen = self.onScreen or false;
 	local enabled = self.enabled or false;
 	local visible = self.drawings.visible;
@@ -1040,6 +1061,13 @@ function EspObject:Render()
 		);
 	else
 		renderCornerBox(self, false);
+	end
+
+	-- плавность баров: коэффициент интерполяции за кадр (nil = выключено)
+	if options.smoothBars then
+		self.smoothAlpha = 1 - math.exp(-(options.smoothBarsSpeed or 8)*(deltaTime or 1/60));
+	else
+		self.smoothAlpha = nil;
 	end
 
 	-- bars: healthBar + кастомные бары (позиция Left / Right / Top / Bottom)
@@ -1171,7 +1199,8 @@ function EspObject:Render()
 		for i = 1, #self.barSlots do
 			local slot = self.barSlots[i];
 			glowLine(self, slot.glowBar, slot.glowShow, slot.gFrom, slot.gTo, slot.gTint, 1, options, slot.glowBarElement, slot.gBase);
-			glowText(self, slot.glowText, slot.text, options, slot.glowTextElement);
+			-- текст бара получает glow только вместе с самим баром
+			glowText(self, slot.glowText, slot.text, options, slot.glowTextElement, (slot.glowShow and glowAllowed(options, slot.glowBarElement)) and true or false);
 		end
 
 		for i = 1, #self.textList do
@@ -1715,6 +1744,8 @@ local EspInterface = {
 			healthyColor = Color3.new(0,1,0),
 			dyingColor = Color3.new(1,0,0),
 			healthBarPosition = "Left", -- "Left" | "Right" | "Top" | "Bottom" (или "Below")
+			smoothBars = false,       -- плавная анимация healthBar и кастомных баров
+			smoothBarsSpeed = 8,      -- скорость анимации (больше = быстрее)
 			-- кастомные бары, значения берутся из EspInterface.getValue(player, name):
 			-- bars = { { name = "armor", position = "Right", healthyColor = Color3.new(0, 0.6, 1), text = true } },
 			-- либо EspInterface.AddBar("armor", { position = "Right", text = true })
@@ -1787,6 +1818,8 @@ local EspInterface = {
 			healthyColor = Color3.new(0,1,0),
 			dyingColor = Color3.new(1,0,0),
 			healthBarPosition = "Left", -- "Left" | "Right" | "Top" | "Bottom" (или "Below")
+			smoothBars = false,       -- плавная анимация healthBar и кастомных баров
+			smoothBarsSpeed = 8,      -- скорость анимации (больше = быстрее)
 			-- кастомные бары, значения берутся из EspInterface.getValue(player, name):
 			-- bars = { { name = "armor", position = "Right", healthyColor = Color3.new(0, 0.6, 1), text = true } },
 			-- либо EspInterface.AddBar("armor", { position = "Right", text = true })
