@@ -358,6 +358,16 @@ local function renderCornerBox(self, show, corners, options, color, transparency
 	end
 end
 
+-- distance: шаблон строки ("{distance} studs", "{distance}m") или функция(distance, player) -> string
+local function formatDistance(template, distance, player)
+	local value = round(distance);
+	if type(template) == "function" then
+		local ok, result = pcall(template, value, player);
+		return ok and tostring(result) or tostring(value);
+	end
+	return (tostring(template or "{distance} studs"):gsub("{distance}", tostring(value)));
+end
+
 -- bars
 local function normalizeSide(position, default)
 	if position == "Left" or position == "Right" or position == "Top" or position == "Bottom" then
@@ -395,10 +405,8 @@ local function normalizeText(spec)
 	spec._normalized = true;
 end
 
-local function barExtent(count, hasText, distance, textSize)
-	if hasText then
-		return distance + 3 + textSize + 2;
-	elseif count > 0 then
+local function barExtent(count, distance)
+	if count > 0 then
 		return distance + 2;
 	end
 	return 0;
@@ -509,9 +517,7 @@ function EspObject:Construct()
 	self.textCount = 0;
 	self.textSlots = {};
 	self.textList = {};
-	self.rightTextWidth = 0;
 	self.sideCount = { Left = 0, Right = 0, Top = 0, Bottom = 0 };
-	self.sideText = { Left = false, Right = false, Top = false, Bottom = false };
 	self.sideDistance = { Left = BAR_BASE_OFFSET, Right = BAR_BASE_OFFSET, Top = BAR_BASE_OFFSET, Bottom = BAR_BASE_OFFSET };
 
 	self.renderConnection = runService.Heartbeat:Connect(function(deltaTime)
@@ -675,9 +681,7 @@ function EspObject:RenderTexts(active, corners)
 		local data = self.textData;
 
 		local extent = 0;
-		if self.sideText.Right then
-			extent = self.sideDistance.Right + HEALTH_TEXT_OFFSET.X + self.rightTextWidth + 2;
-		elseif self.sideCount.Right > 0 then
+		if self.sideCount.Right > 0 then
 			extent = self.sideDistance.Right + 2;
 		end
 
@@ -775,22 +779,16 @@ function EspObject:_pushEntry(n, slot, spec, value, max, defaultSide, drawBar, d
 		entry.index = 0;
 	end
 
-	if drawText then
-		self.sideText[side] = true;
-	end
 	return n;
 end
 
 -- раскладка баров по сторонам (стек наружу от бокса), считает сдвиги для name/distance/weapon
 function EspObject:LayoutBars(active, options)
-	local counts, texts, distances = self.sideCount, self.sideText, self.sideDistance;
+	local counts, distances = self.sideCount, self.sideDistance;
 	for i = 1, #BAR_SIDES do
 		local side = BAR_SIDES[i];
 		counts[side] = 0;
-		texts[side] = false;
 	end
-
-	self.rightTextWidth = 0;
 
 	local n = 0;
 	if active then
@@ -808,7 +806,7 @@ function EspObject:LayoutBars(active, options)
 		spec.textColor = options.healthTextColor;
 		spec.textOutline = options.healthTextOutline;
 		spec.textOutlineColor = options.healthTextOutlineColor;
-		spec.textSuffix = "hp";
+		spec.textSuffix = "";
 
 		local drawBar = spec.enabled and true or false;
 		local drawText = spec.text and true or false;
@@ -826,13 +824,12 @@ function EspObject:LayoutBars(active, options)
 	end
 	self.entryCount = n;
 
-	local textSize = self.interface.sharedSettings.textSize;
 	for i = 1, #BAR_SIDES do
 		local side = BAR_SIDES[i];
 		distances[side] = BAR_BASE_OFFSET + mathMax(counts[side] - 1, 0)*BAR_STACK_STEP;
 	end
-	self.topExtent = barExtent(counts.Top, texts.Top, distances.Top, textSize);
-	self.bottomExtent = barExtent(counts.Bottom, texts.Bottom, distances.Bottom, textSize);
+	self.topExtent = barExtent(counts.Top, distances.Top);
+	self.bottomExtent = barExtent(counts.Bottom, distances.Bottom);
 end
 
 function EspObject:HideBar(slot)
@@ -915,8 +912,9 @@ function EspObject:RenderBar(entry, corners)
 		self:HideGradient(slot.segments);
 	end
 
+	-- текст: только число, прямо на краю заливки; виден только если бар не полный
 	local text = slot.text;
-	if entry.drawText then
+	if entry.drawText and ratio < 1 then
 		text.Visible = true;
 		text.Text = tostring(spec.textFormat and spec.textFormat(value, max) or (round(value) .. (spec.textSuffix or "")));
 		text.Size = interface.sharedSettings.textSize;
@@ -925,21 +923,7 @@ function EspObject:RenderBar(entry, corners)
 		text.Transparency = spec.textColor[2];
 		text.Outline = spec.textOutline;
 		text.OutlineColor = parseColor(self, spec.textOutlineColor, true);
-
-		local half = text.TextBounds*0.5;
-		local gap = HEALTH_TEXT_OFFSET.X;
-		if side == "Right" then
-			self.rightTextWidth = mathMax(self.rightTextWidth, half.X*2);
-		end
-		if side == "Left" then
-			text.Position = Vector2.new(topLeft.X - textDistance - gap - half.X, fillEnd.Y - half.Y);
-		elseif side == "Right" then
-			text.Position = Vector2.new(topRight.X + textDistance + gap + half.X, fillEnd.Y - half.Y);
-		elseif side == "Top" then
-			text.Position = Vector2.new(fillEnd.X + gap + half.X, topLeft.Y - textDistance - gap - half.Y*2);
-		else
-			text.Position = Vector2.new(fillEnd.X + gap + half.X, bottomLeft.Y + textDistance + gap);
-		end
+		text.Position = fillEnd - Vector2.new(0, text.TextBounds.Y*0.5);
 	else
 		text.Visible = false;
 	end
@@ -1087,7 +1071,7 @@ function EspObject:Render()
 	visible.distance.Visible = enabled and onScreen and self.distance and options.distance;
 	if visible.distance.Visible then
 		local distance = visible.distance;
-		distance.Text = round(self.distance) .. " studs";
+		distance.Text = formatDistance(options.distanceText, self.distance, self.player);
 		distance.Size = interface.sharedSettings.textSize;
 		distance.Font = interface.sharedSettings.textFont;
 		distance.Color = parseColor(self, options.distanceColor[1]);
@@ -1300,6 +1284,7 @@ function InstanceObject:Construct()
 	options.distanceColor = options.distanceColor or { Color3.new(1,1,1), 1 };
 	options.distanceOutline = options.distanceOutline == nil and true or options.distanceOutline;
 	options.distanceOutlineColor = options.distanceOutlineColor or Color3.new();
+	options.distanceText = options.distanceText or "{distance} studs";
 
 	-- box
 	options.box = options.box or false;
@@ -1567,7 +1552,7 @@ function InstanceObject:Render()
 	self.distanceDrawing.Visible = visible and options.distance;
 	if self.distanceDrawing.Visible then
 		local distD = self.distanceDrawing;
-		distD.Text = round(depth) .. " studs";
+		distD.Text = formatDistance(options.distanceText, depth);
 		distD.Size = options.textSize;
 		distD.Font = options.textFont;
 		distD.Color = options.distanceColor[1];
@@ -1760,6 +1745,7 @@ local EspInterface = {
 			distanceColor = { Color3.new(1,1,1), 1 },
 			distanceOutline = true,
 			distanceOutlineColor = Color3.new(),
+			distanceText = "{distance} studs", -- шаблон ({distance} = число) или function(distance, player) return "..." end
 			tracer = false,
 			tracerOrigin = "Bottom",
 			tracerColor = { Color3.new(1,0,0), 1 },
@@ -1831,6 +1817,7 @@ local EspInterface = {
 			distanceColor = { Color3.new(1,1,1), 1 },
 			distanceOutline = true,
 			distanceOutlineColor = Color3.new(),
+			distanceText = "{distance} studs", -- шаблон ({distance} = число) или function(distance, player) return "..." end
 			tracer = false,
 			tracerOrigin = "Bottom",
 			tracerColor = { Color3.new(0,1,0), 1 },
@@ -1864,7 +1851,8 @@ end
 -- team = "enemy" | "friendly" (nil = оба). Конфиг (все поля необязательны):
 --   position = "Left" | "Right" | "Top" | "Bottom" (или "Below"), по умолчанию "Right"
 --   healthyColor, dyingColor, gradient, gradientSegments, outline, outlineColor = { Color3, transparency }
---   text, textColor = { Color3, transparency }, textOutline, textOutlineColor, textSuffix, textFormat = function(value, max)
+--   text (число на краю заливки, показывается только если бар не полный), textColor = { Color3, transparency },
+--   textOutline, textOutlineColor, textSuffix, textFormat = function(value, max)
 --   getValue = function(player, name) return value, max end -- переопределяет EspInterface.getValue
 local function addSpec(listName, normalize, name, config, team)
 	assert(type(name) == "string", "Missing argument #1 (string expected)");
