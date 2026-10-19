@@ -51,7 +51,7 @@ local BAR_OUTLINE_OFFSET_H = Vector2.new(1, 0);
 local BAR_SIDES = { "Left", "Right", "Top", "Bottom" };
 local TEXT_RIGHT_GAP = 4;      -- отступ кастомного текста от бокса / баров справа
 local TEXT_LINE_GAP = 1;       -- расстояние между строками кастомного текста
-local TEXT_MIN_SIZE = 8;       -- минимальный размер кастомного текста при масштабировании
+local TEXT_MIN_SIZE = 6;       -- минимальный размер кастомного текста при масштабировании
 local GRADIENT_DEFAULT_SEGMENTS = 16;
 local GRADIENT_MAX_SEGMENTS = 64;
 local DISTANCE_OFFSET = Vector2.new(0, 2);
@@ -698,7 +698,7 @@ function EspObject:RenderTexts(active, corners)
 			local drawing = slot.drawing;
 
 			item.slot = slot;
-			item.baseSize = spec.size or shared.textSize;
+			item.baseSize = mathMin(spec.size or shared.textSize, spec.maxSize or math.huge);
 			item.font = spec.font or shared.textFont;
 
 			if slot.measuredText ~= item.text or slot.measuredSize ~= item.baseSize or slot.measuredFont ~= item.font then
@@ -1947,7 +1947,8 @@ end
 -- кастомные тексты справа от бокса: EspInterface.AddText(name, config, team)
 -- Конфиг (все поля необязательны):
 --   color = { Color3, transparency }, outline, outlineColor, size, font, spacing
---   scale = false -- не уменьшать размер, когда стек не влезает в бокс; minSize = 8 -- нижний предел размера
+--   maxSize = 13 -- верхний предел размера; minSize = 6 -- нижний предел при отдалении (меньше = мельче вдали)
+--   scale = false -- не уменьшать размер, когда стек не влезает в бокс
 --   text = "строка" -- статичный текст (вместо getText)
 --   getText = function(player, name) return "30/90" end -- переопределяет EspInterface.getText
 -- Текст nil или "" = строка скрыта, следующие поднимаются вверх
