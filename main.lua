@@ -51,6 +51,15 @@ local BAR_OUTLINE_OFFSET_H = Vector2.new(1, 0);
 local BAR_SIDES = { "Left", "Right", "Top", "Bottom" };
 local TEXT_RIGHT_GAP = 4;      -- отступ кастомного текста от бокса / баров справа
 local TEXT_LINE_GAP = 1;       -- расстояние между строками кастомного текста
+local INV_GAP = 3;               -- отступ инвентаря от бокса / баров
+local INV_ITEM_GAP = 2;          -- расстояние между предметами
+local INV_MAX_ITEMS = 12;
+local INV_DEFAULT_COLOR = { Color3.new(1, 1, 1), 1 };
+local INV_TEXT_KEYS, INV_BOX_KEYS = {}, {};
+for i = 1, INV_MAX_ITEMS do
+	INV_TEXT_KEYS[i] = "invText" .. i;
+	INV_BOX_KEYS[i] = "invBox" .. i;
+end
 local TEXT_MIN_SIZE = 6;       -- минимальный размер кастомного текста при масштабировании
 local GRADIENT_DEFAULT_SEGMENTS = 16;
 local GRADIENT_MAX_SEGMENTS = 64;
@@ -368,6 +377,53 @@ local function formatDistance(template, distance, player)
 	return (tostring(template or "{distance} studs"):gsub("{distance}", tostring(value)));
 end
 
+-- inventory icons: Drawing "Image" принимает только сырые байты картинки,
+-- поэтому иконки (asset id / rbxassetid:// / http-ссылка) качаются асинхронно и кешируются.
+-- Пока иконка не загрузилась (или Image не поддерживается экзекутором) показывается текст.
+local httpService = game:GetService("HttpService");
+local iconCache = {};          -- key -> байты | true (грузится) | число (время неудачи, повтор через 20с)
+local IMAGE_UNSUPPORTED = false;
+
+local function getIconData(icon)
+	local id = tonumber(icon);
+	local url;
+	if not id and type(icon) == "string" then
+		id = tonumber(icon:match("rbxassetid://(%d+)") or icon:match("[?&]id=(%d+)"));
+		if not id and icon:match("^https?://") then
+			url = icon;
+		end
+	end
+
+	local key = id and ("asset:" .. id) or url;
+	if not key then
+		return nil;
+	end
+
+	local cached = iconCache[key];
+	if type(cached) == "string" then
+		return cached;
+	elseif cached == true or (type(cached) == "number" and os.clock() - cached < 20) then
+		return nil;
+	end
+
+	iconCache[key] = true;
+	task.spawn(function()
+		local ok, data = pcall(function()
+			local target = url;
+			if id then
+				local meta = httpService:JSONDecode(game:HttpGet(
+					"https://thumbnails.roblox.com/v1/assets?assetIds=" .. id ..
+					"&returnPolicy=PlaceHolder&size=150x150&format=Png&isCircular=false"
+				));
+				target = meta.data[1].imageUrl;
+			end
+			return game:HttpGet(target);
+		end);
+		iconCache[key] = (ok and type(data) == "string" and #data > 0) and data or os.clock();
+	end);
+	return nil;
+end
+
 -- bars
 local function normalizeSide(position, default)
 	if position == "Left" or position == "Right" or position == "Top" or position == "Bottom" then
@@ -513,6 +569,10 @@ function EspObject:Construct()
 	self.renderId = 0;
 	self.topExtent = 0;
 	self.bottomExtent = 0;
+	self.invRightExtent = 0;
+	self.invSlots = {};
+	self.inventoryItems = nil;
+	self.inventoryClock = 0;
 	self.textData = {};
 	self.textCount = 0;
 	self.textSlots = {};
@@ -684,6 +744,9 @@ function EspObject:RenderTexts(active, corners)
 		if self.sideCount.Right > 0 then
 			extent = self.sideDistance.Right + 2;
 		end
+		if self.invRightExtent > 0 then
+			extent = self.invRightExtent;
+		end
 
 		local x = corners.topRight.X + extent + TEXT_RIGHT_GAP;
 		local y = corners.topRight.Y;
@@ -750,6 +813,219 @@ function EspObject:RenderTexts(active, corners)
 	for i = 1, #list do
 		if list[i].usedId ~= renderId then
 			list[i].drawing.Visible = false;
+		end
+	end
+end
+
+-- инвентарь: список предметов из getInventory, обновляется раз в inventoryRefresh секунд
+function EspObject:UpdateInventory()
+	local options = self.options;
+	if not options.inventory then
+		self.inventoryItems = nil;
+		return;
+	end
+
+	local now = os.clock();
+	if now - self.inventoryClock < (options.inventoryRefresh or 0.25) then
+		return;
+	end
+	self.inventoryClock = now;
+
+	local ok, items = pcall(self.interface.getInventory, self.player);
+	self.inventoryItems = (ok and type(items) == "table") and items or nil;
+end
+
+function EspObject:_getInvSlot(index, wantImage)
+	local slot = self.invSlots[index];
+	if not slot then
+		slot = {
+			box = self:_create("Square", { Thickness = 1, Filled = false, Visible = false }),
+			text = self:_create("Text", { Center = true, Visible = false })
+		};
+		self.invSlots[index] = slot;
+	end
+
+	if wantImage and not slot.image and not slot.imageTried and not IMAGE_UNSUPPORTED then
+		slot.imageTried = true;
+		local ok, image = pcall(Drawing.new, "Image");
+		if ok and image then
+			pcall(function()
+				image.ZIndex = 1;
+				image.Visible = false;
+			end);
+			self.bin[#self.bin + 1] = image;
+			slot.image = image;
+		else
+			IMAGE_UNSUPPORTED = true;
+		end
+	end
+	return slot;
+end
+
+function EspObject:_placeInvSlot(slot, x, y, options)
+	slot.usedId = self.renderId;
+
+	local item = slot.item;
+	local equipped = item.equipped and true or false;
+	local color = (equipped and options.inventoryEquippedColor or options.inventoryColor) or INV_DEFAULT_COLOR;
+	local text, image, box = slot.text, slot.image, slot.box;
+
+	if slot.data then
+		text.Visible = false;
+		if slot.imageData ~= slot.data then
+			image.Data = slot.data;
+			slot.imageData = slot.data;
+		end
+		image.Position = Vector2.new(x, y);
+		image.Size = Vector2.new(slot.w, slot.h);
+		image.Transparency = color[2];
+		image.Visible = true;
+
+		if equipped then
+			box.Position = Vector2.new(x - 1, y - 1);
+			box.Size = Vector2.new(slot.w + 2, slot.h + 2);
+			box.Color = color[1];
+			box.Transparency = color[2];
+			box.Visible = true;
+		else
+			box.Visible = false;
+		end
+	else
+		if image then
+			image.Visible = false;
+		end
+		box.Visible = false;
+
+		text.Visible = true;
+		text.Color = color[1];
+		text.Transparency = color[2];
+		text.Outline = options.inventoryOutline and true or false;
+		text.OutlineColor = options.inventoryOutlineColor or Color3.new();
+		text.Position = Vector2.new(x + slot.w*0.5, y);
+	end
+end
+
+-- инвентарь рядом с боксом (Left / Right / Top / Bottom), снаружи от баров.
+-- Если предметы не влезают в сторону бокса (игрок далеко) - иконки/текст уменьшаются
+function EspObject:RenderInventory(active, corners, options)
+	local renderId = self.renderId;
+	self.invRightExtent = 0;
+
+	local items = active and self.inventoryItems;
+	if items and #items > 0 then
+		local shared = self.interface.sharedSettings;
+		local side = normalizeSide(options.inventoryPosition, "Bottom");
+		local vertical = side == "Left" or side == "Right";
+		local iconMode = options.inventoryMode ~= "Text";
+		local maxItems = clamp(floor(options.inventoryMaxItems or 6), 1, INV_MAX_ITEMS);
+		local baseIcon = options.inventoryIconSize or 24;
+		local baseText, font = shared.textSize, shared.textFont;
+		local slots = self.invSlots;
+
+		-- 1) какие предметы показываем + длина при базовом размере
+		local count, total = 0, 0;
+		for i = 1, #items do
+			if count >= maxItems then
+				break;
+			end
+
+			local item = items[i];
+			if item.equipped or not options.inventoryEquippedOnly then
+				count = count + 1;
+				local slot = self:_getInvSlot(count, iconMode);
+				local data = iconMode and slot.image and (item.iconData or getIconData(item.icon)) or nil;
+				slot.item, slot.data, slot.label = item, data, tostring(item.name or "?");
+
+				local length;
+				if data then
+					length = baseIcon;
+				else
+					local text = slot.text;
+					if slot.mText ~= slot.label or slot.mSize ~= baseText or slot.mFont ~= font then
+						text.Text = slot.label;
+						text.Size = baseText;
+						text.Font = font;
+						local bounds = text.TextBounds;
+						slot.baseW, slot.baseH = bounds.X, bounds.Y;
+						slot.mText, slot.mSize, slot.mFont = slot.label, baseText, font;
+					end
+					length = vertical and slot.baseH or slot.baseW;
+				end
+				total = total + length + (count > 1 and INV_ITEM_GAP or 0);
+			end
+		end
+
+		-- 2) масштаб
+		local boxWidth = corners.topRight.X - corners.topLeft.X;
+		local boxHeight = corners.bottomLeft.Y - corners.topLeft.Y;
+		local available = vertical and boxHeight or boxWidth*1.5;
+		local iconSize, textSize = baseIcon, baseText;
+		if options.inventoryScale ~= false and total > available and total > 0 then
+			local scale = mathMax(available, 0)/total;
+			iconSize = mathMin(baseIcon, mathMax(options.inventoryMinIconSize or 8, floor(baseIcon*scale + 0.5)));
+			textSize = mathMin(baseText, mathMax(TEXT_MIN_SIZE, floor(baseText*scale + 0.5)));
+		end
+
+		-- 3) итоговые размеры
+		local totalLength, maxPerp = 0, 0;
+		for i = 1, count do
+			local slot = slots[i];
+			if slot.data then
+				slot.w, slot.h = iconSize, iconSize;
+			else
+				local text = slot.text;
+				text.Text = slot.label;
+				text.Size = textSize;
+				text.Font = font;
+				local bounds = text.TextBounds;
+				slot.w, slot.h = bounds.X, bounds.Y;
+			end
+			totalLength = totalLength + (vertical and slot.h or slot.w) + (i > 1 and INV_ITEM_GAP or 0);
+			maxPerp = mathMax(maxPerp, vertical and slot.w or slot.h);
+		end
+
+		-- 4) позиции
+		local barOffset = self.sideCount[side] > 0 and (self.sideDistance[side] + 2) or 0;
+		local offset = barOffset + INV_GAP;
+
+		if vertical then
+			local edgeX = side == "Right" and (corners.topRight.X + offset) or (corners.topLeft.X - offset);
+			local y = corners.topLeft.Y;
+			for i = 1, count do
+				local slot = slots[i];
+				self:_placeInvSlot(slot, side == "Right" and edgeX or (edgeX - slot.w), y, options);
+				y = y + slot.h + INV_ITEM_GAP;
+			end
+		else
+			local x = (corners.topLeft.X + corners.topRight.X)*0.5 - totalLength*0.5;
+			local baseY = side == "Top" and (corners.topLeft.Y - offset) or (corners.bottomLeft.Y + offset);
+			for i = 1, count do
+				local slot = slots[i];
+				self:_placeInvSlot(slot, x, side == "Top" and (baseY - slot.h) or baseY, options);
+				x = x + slot.w + INV_ITEM_GAP;
+			end
+		end
+
+		-- сдвиг name / distance / weapon / кастомных текстов
+		local extent = offset + maxPerp + 2;
+		if side == "Top" then
+			self.topExtent = extent;
+		elseif side == "Bottom" then
+			self.bottomExtent = extent;
+		elseif side == "Right" then
+			self.invRightExtent = extent;
+		end
+	end
+
+	local slots = self.invSlots;
+	for i = 1, #slots do
+		local slot = slots[i];
+		if slot.usedId ~= renderId then
+			slot.text.Visible = false;
+			slot.box.Visible = false;
+			if slot.image then
+				slot.image.Visible = false;
+			end
 		end
 	end
 end
@@ -976,6 +1252,7 @@ function EspObject:Update()
 	if self.enabled then
 		self:UpdateBars();
 		self:UpdateTexts();
+		self:UpdateInventory();
 	end
 
 	local head = self.enabled and findFirstChild(self.character, "Head");
@@ -1082,6 +1359,7 @@ function EspObject:Render(deltaTime)
 			self:HideBar(slot);
 		end
 	end
+	self:RenderInventory(enabled and onScreen and options.inventory, corners, options);
 	self:RenderTexts(enabled and onScreen, corners);
 
 	visible.name.Visible = enabled and onScreen and options.name;
@@ -1206,6 +1484,13 @@ function EspObject:Render(deltaTime)
 		for i = 1, #self.textList do
 			local slot = self.textList[i];
 			glowText(self, slot.glowKey, slot.drawing, options, "customText");
+		end
+
+		for i = 1, #self.invSlots do
+			local slot = self.invSlots[i];
+			local box = slot.box;
+			glowText(self, INV_TEXT_KEYS[i], slot.text, options, "inventory");
+			glowSquare(self, INV_BOX_KEYS[i], box.Visible, box.Position, box.Size, box.Color, box.Transparency, options, "inventory", 1, false);
 		end
 
 		glowText(self, "name", visible.name, options, "name");
@@ -1727,7 +2012,7 @@ local EspInterface = {
 			glowIntensity = 0.6,
 			glowTextLayers = 1,
 			-- glowColor = Color3.new(1, 1, 1), -- необязательно; по умолчанию цвет самого элемента
-			-- glowElements = { box = true, boxFill = true, box3d = true, cornerBox = true, healthBar = true, healthText = true,
+			-- glowElements = { box = true, boxFill = true, box3d = true, cornerBox = true, inventory = true, healthBar = true, healthText = true,
 			--                  name = true, distance = true, weapon = true, tracer = true, arrow = true };
 			box = false,
 			boxColor = { Color3.new(1,0,0), 1 },
@@ -1754,6 +2039,20 @@ local EspInterface = {
 			-- texts = { { name = "ammo", color = { Color3.new(1, 1, 0), 1 } } },
 			-- либо EspInterface.AddText("ammo", { color = { Color3.new(1, 1, 0), 1 } })
 			texts = {},
+			-- инвентарь игрока (иконки или текст), позиция как у баров, масштабируется с дистанцией
+			inventory = false,
+			inventoryPosition = "Bottom",  -- "Left" | "Right" | "Top" | "Bottom"
+			inventoryMode = "Icon",        -- "Icon" (если иконка не загрузилась - текст) | "Text"
+			inventoryIconSize = 24,        -- максимальный размер иконки
+			inventoryMinIconSize = 8,      -- минимум при отдалении
+			inventoryScale = true,
+			inventoryMaxItems = 6,
+			inventoryEquippedOnly = false,
+			inventoryColor = { Color3.new(1, 1, 1), 1 },
+			inventoryEquippedColor = { Color3.new(1, 0.8, 0), 1 },
+			inventoryOutline = true,
+			inventoryOutlineColor = Color3.new(),
+			inventoryRefresh = 0.25,       -- как часто опрашивать getInventory (сек)
 			healthBarGradient = false,
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
@@ -1801,7 +2100,7 @@ local EspInterface = {
 			glowIntensity = 0.6,
 			glowTextLayers = 1,
 			-- glowColor = Color3.new(1, 1, 1), -- необязательно; по умолчанию цвет самого элемента
-			-- glowElements = { box = true, boxFill = true, box3d = true, cornerBox = true, healthBar = true, healthText = true,
+			-- glowElements = { box = true, boxFill = true, box3d = true, cornerBox = true, inventory = true, healthBar = true, healthText = true,
 			--                  name = true, distance = true, weapon = true, tracer = true, arrow = true };
 			box = false,
 			boxColor = { Color3.new(0,1,0), 1 },
@@ -1828,6 +2127,20 @@ local EspInterface = {
 			-- texts = { { name = "ammo", color = { Color3.new(1, 1, 0), 1 } } },
 			-- либо EspInterface.AddText("ammo", { color = { Color3.new(1, 1, 0), 1 } })
 			texts = {},
+			-- инвентарь игрока (иконки или текст), позиция как у баров, масштабируется с дистанцией
+			inventory = false,
+			inventoryPosition = "Bottom",  -- "Left" | "Right" | "Top" | "Bottom"
+			inventoryMode = "Icon",        -- "Icon" (если иконка не загрузилась - текст) | "Text"
+			inventoryIconSize = 24,        -- максимальный размер иконки
+			inventoryMinIconSize = 8,      -- минимум при отдалении
+			inventoryScale = true,
+			inventoryMaxItems = 6,
+			inventoryEquippedOnly = false,
+			inventoryColor = { Color3.new(1, 1, 1), 1 },
+			inventoryEquippedColor = { Color3.new(1, 0.8, 0), 1 },
+			inventoryOutline = true,
+			inventoryOutlineColor = Color3.new(),
+			inventoryRefresh = 0.25,       -- как часто опрашивать getInventory (сек)
 			healthBarGradient = false,
 			healthBarGradientSegments = 16,
 			healthBarOutline = true,
@@ -2008,6 +2321,32 @@ end
 -- game specific functions
 function EspInterface.getWeapon(player)
 	return "Unknown";
+end
+
+-- инвентарь игрока: return { { name = "AK-47", icon = assetId / "rbxassetid://..." / "https://...", equipped = true }, ... }
+-- вместо icon можно отдать iconData = "<байты png/jpeg>". Без icon (или без поддержки Image) показывается имя
+function EspInterface.getInventory(player)
+	local items = {};
+
+	local character = player.Character;
+	if character then
+		for _, child in next, getChildren(character) do
+			if isA(child, "Tool") then
+				items[#items + 1] = { name = child.Name, icon = child.TextureId, equipped = true };
+			end
+		end
+	end
+
+	local backpack = findFirstChildOfClass(player, "Backpack");
+	if backpack then
+		for _, child in next, getChildren(backpack) do
+			if isA(child, "Tool") then
+				items[#items + 1] = { name = child.Name, icon = child.TextureId, equipped = false };
+			end
+		end
+	end
+
+	return items;
 end
 
 -- значение для кастомных баров: return value, maxValue (nil = бар скрыт)
